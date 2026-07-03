@@ -702,6 +702,7 @@ function createProvider(): ProviderProfile {
     useResponseApi: false,
     // 与安卓 OpenAI provider 默认值一致 (commit e63d017)
     includeHistoryReasoning: true,
+    forceDirectTransport: false,
     models: [],
     balanceOption: { enabled: false, apiPath: "/credits", resultPath: "data.total_credits" },
   };
@@ -2014,21 +2015,38 @@ function ProvidersSection({
               />
             </div>
             {kind === "openai" ? (
-              <div className="flex items-start justify-between gap-3 rounded-md border px-3 py-3 md:col-span-2">
-                <div className="min-w-0 flex-1 space-y-1">
-                  <div className="text-sm font-medium">{t("settings:providers.history_reasoning_title")}</div>
-                  <div className="text-xs leading-relaxed text-muted-foreground">
-                    {t("settings:providers.history_reasoning_desc")}
+              <>
+                <div className="flex items-start justify-between gap-3 rounded-md border px-3 py-3 md:col-span-2">
+                  <div className="min-w-0 flex-1 space-y-1">
+                    <div className="text-sm font-medium">{t("settings:providers.history_reasoning_title")}</div>
+                    <div className="text-xs leading-relaxed text-muted-foreground">
+                      {t("settings:providers.history_reasoning_desc")}
+                    </div>
                   </div>
+                  <Switch
+                    className="mt-1 shrink-0"
+                    checked={draft.includeHistoryReasoning !== false}
+                    onCheckedChange={(includeHistoryReasoning) =>
+                      patchDraft({ includeHistoryReasoning })
+                    }
+                  />
                 </div>
-                <Switch
-                  className="mt-1 shrink-0"
-                  checked={draft.includeHistoryReasoning !== false}
-                  onCheckedChange={(includeHistoryReasoning) =>
-                    patchDraft({ includeHistoryReasoning })
-                  }
-                />
-              </div>
+                <div className="flex items-start justify-between gap-3 rounded-md border px-3 py-3 md:col-span-2">
+                  <div className="min-w-0 flex-1 space-y-1">
+                    <div className="text-sm font-medium">Direct transport</div>
+                    <div className="text-xs leading-relaxed text-muted-foreground">
+                      Bypass Bun native fetch and use the fallback direct transport for this OpenAI-compatible provider.
+                    </div>
+                  </div>
+                  <Switch
+                    className="mt-1 shrink-0"
+                    checked={draft.forceDirectTransport === true}
+                    onCheckedChange={(forceDirectTransport) =>
+                      patchDraft({ forceDirectTransport })
+                    }
+                  />
+                </div>
+              </>
             ) : null}
             {kind === "claude" ? (
               <div className="grid gap-3 rounded-md border px-3 py-3 md:col-span-2 md:grid-cols-[1fr_180px]">

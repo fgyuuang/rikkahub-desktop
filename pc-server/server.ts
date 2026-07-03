@@ -63,6 +63,7 @@ interface Provider {
   // assistant 的 reasoning_content 也回传给上游。默认 true（保持过去行为）；
   // 用户可以为某些代理/平台关闭，避免它们因为不识别这个字段而拒绝请求。
   includeHistoryReasoning?: boolean;
+  forceDirectTransport?: boolean;
   promptCaching?: boolean;
   promptCacheTtl?: "5m" | "1h";
   testPassed?: boolean;
@@ -807,6 +808,7 @@ function provider(input: Partial<Provider> & Pick<Provider, "id" | "name" | "bas
     useResponseApi: false,
     // 对齐安卓 ProviderSetting.OpenAI.includeHistoryReasoning 默认值 (commit e63d017)
     includeHistoryReasoning: true,
+    forceDirectTransport: false,
     promptCaching: false,
     promptCacheTtl: "5m",
     testPassed: input.name === "RikkaHub" || input.id === "a8d2d463-e8c0-41f2-b89e-f5eb8e716cce",
@@ -10246,6 +10248,69 @@ function hostOfProvider(providerItem: Provider) {
   }
 }
 
+function shouldBypassSystemProxyForProvider(providerItem: Provider) {
+  return providerItem.forceDirectTransport === true || hostOfProvider(providerItem) === "chat.ecnu.edu.cn";
+}
+
+async function fetchProviderUrl(
+  providerItem: Provider,
+  url: string,
+  init: RequestInit = {},
+) {
+  if (!shouldBypassSystemProxyForProvider(providerItem)) {
+    return fetch(url, init);
+  }
+
+  const method = String(init.method ?? "GET").toUpperCase();
+  const headers = new Headers(init.headers ?? {});
+  const tmpBodyPath = method === "GET" || init.body == null
+    ? ""
+    : join(process.env.TEMP || process.env.TMP || ".", `rikka-ecnu-${Date.now()}-${Math.random().toString(16).slice(2)}.json`);
+  if (tmpBodyPath) {
+    const bodyText = typeof init.body === "string"
+      ? init.body
+      : init.body instanceof Uint8Array
+        ? new TextDecoder().decode(init.body)
+        : String(init.body);
+    await Bun.write(tmpBodyPath, bodyText);
+  }
+  const args = ["--silent", "--show-error", "--include", "--request", method, url];
+  headers.forEach((value, key) => {
+    args.push("-H", `${key}: ${value}`);
+  });
+  if (tmpBodyPath) {
+    args.push("--data-binary", `@${tmpBodyPath}`);
+  }
+  try {
+    const proc = Bun.spawnSync(["curl.exe", ...args], { stdout: "pipe", stderr: "pipe", timeout: 60_000 });
+    const stdout = new TextDecoder().decode(proc.stdout ?? new Uint8Array());
+    const stderr = new TextDecoder().decode(proc.stderr ?? new Uint8Array());
+    if (proc.exitCode !== 0) {
+      throw new Error((stderr || stdout || `curl exit ${proc.exitCode}`).trim());
+    }
+    const separator = stdout.includes("\r\n\r\n") ? "\r\n\r\n" : "\n\n";
+    const chunks = stdout.split(separator).filter(Boolean);
+    const rawHeaders = chunks.length > 1 ? chunks.slice(0, -1).join(separator) : "";
+    const body = chunks.length > 1 ? chunks[chunks.length - 1] : stdout;
+    const headerBlock = rawHeaders ? rawHeaders.split(separator).pop() ?? "" : "";
+    const statusLine = headerBlock.split(/\r?\n/)[0] ?? "HTTP/1.1 200 OK";
+    const statusMatch = statusLine.match(/HTTP\/\d(?:\.\d)?\s+(\d{3})\s*(.*)$/i);
+    const status = Number(statusMatch?.[1] ?? 200);
+    const statusText = String(statusMatch?.[2] ?? "OK").trim() || "OK";
+    const responseHeaders = new Headers();
+    for (const line of headerBlock.split(/\r?\n/).slice(1)) {
+      const idx = line.indexOf(":");
+      if (idx <= 0) continue;
+      responseHeaders.append(line.slice(0, idx).trim(), line.slice(idx + 1).trim());
+    }
+    return new Response(body, { status, statusText, headers: responseHeaders });
+  } finally {
+    if (tmpBodyPath && existsSync(tmpBodyPath)) {
+      try { unlinkSync(tmpBodyPath); } catch {}
+    }
+  }
+}
+
 function reasoningPayloadForProvider(providerItem: Provider, modelItem: Model, level: string | null | undefined) {
   if (!supportsAbility(modelItem, "REASONING")) return {};
   const normalized = reasoningLevelNormalized(level);
@@ -10307,11 +10372,14 @@ function reasoningPayloadForProvider(providerItem: Provider, modelItem: Model, l
     return { reasoning_effort: normalized };
   }
   if (host === "chat.intern-ai.org.cn") return { thinking_mode: enabled };
-  // Android default else branch: passes effort through as-is (including "xhigh").
-  // OFF maps to "low" (lowest budget), AUTO sends no field.
-  if (normalized === "auto") return {};
-  if (normalized === "off") return { reasoning_effort: "low" };
-  return { reasoning_effort: normalized };
+  if (host === "chat.ecnu.edu.cn") {
+    if (normalized === "off") return { thinking: { type: "disabled" } };
+    return { thinking: { type: "enabled" } };
+  }
+  // Generic OpenAI-compatible fallback: prefer a plain thinking switch.
+  // Only emit strength/effort for hosts with explicit mappings above.
+  if (normalized === "off") return { thinking: { type: "disabled" } };
+  return { thinking: { type: "enabled" } };
 }
 
 function auxiliaryReasoningPayloadForProvider(providerItem: Provider, modelItem: Model, level: string | null | undefined) {
@@ -10474,7 +10542,7 @@ async function fetchProviderModels(providerItem: Provider) {
   const started = Date.now();
   let response: Response;
   try {
-    response = await fetch(endpoint, { headers: providerHeaders(providerItem) });
+    response = await fetchProviderUrl(providerItem, endpoint, { headers: providerHeaders(providerItem) });
   } catch (err) {
     const detail = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
     addLog({
@@ -10535,7 +10603,7 @@ async function fetchProviderBalance(providerItem: Provider) {
   const started = Date.now();
   let response: Response;
   try {
-    response = await fetch(endpoint, { headers: providerHeaders(providerItem) });
+    response = await fetchProviderUrl(providerItem, endpoint, { headers: providerHeaders(providerItem) });
   } catch (err) {
     const detail = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
     addLog({
@@ -10784,7 +10852,7 @@ async function runProviderCheck(providerItem: Provider, mode: "non_stream" | "st
     modelItem,
   );
   try {
-    response = await fetch(url, {
+    response = await fetchProviderUrl(providerItem, url, {
       method: "POST",
       headers,
       body: JSON.stringify(body),
@@ -11875,7 +11943,7 @@ async function fetchText(
   signal?: AbortSignal,
 ) {
   const started = Date.now();
-  const response = await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal });
+  const response = await fetchProviderUrl(providerItem, url, { method: "POST", headers, body: JSON.stringify(body), signal });
   const rawText = await response.text();
   let raw: any = {};
   try {
@@ -11954,7 +12022,7 @@ async function streamClaudeChat(
   hooks: StreamHooks,
 ) {
   const started = Date.now();
-  const response = await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal });
+  const response = await fetchProviderUrl(providerItem, url, { method: "POST", headers, body: JSON.stringify(body), signal });
   if (!response.ok) {
     const text = await response.text();
     addLog({
@@ -13101,7 +13169,7 @@ async function fetchOpenAiAuxiliaryStream(
   onDelta: (text: string) => void,
 ) {
   const started = Date.now();
-  const response = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+  const response = await fetchProviderUrl(providerItem, url, { method: "POST", headers, body: JSON.stringify(body) });
   let text = "";
   if (response.ok) {
     text = await readOpenAiStream(response, (delta, raw) => {
@@ -13140,7 +13208,7 @@ async function fetchClaudeAuxiliaryStream(
   onDelta: (text: string) => void,
 ) {
   const started = Date.now();
-  const response = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+  const response = await fetchProviderUrl(providerItem, url, { method: "POST", headers, body: JSON.stringify(body) });
   if (!response.ok) {
     const text = await response.text();
     addLog({
@@ -13244,7 +13312,7 @@ async function fetchGoogleAuxiliaryStream(
   onDelta: (text: string) => void,
 ) {
   const started = Date.now();
-  const response = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+  const response = await fetchProviderUrl(providerItem, url, { method: "POST", headers, body: JSON.stringify(body) });
   const rawText = await response.text();
   addLog({
     providerId: providerItem.id,
@@ -13563,7 +13631,7 @@ async function fetchOpenAiTextStreaming(
       else signal.addEventListener("abort", abortHandler, { once: true });
     }
     timeout = setTimeout(() => controller.abort(new Error(`Response header timeout: no response from provider for ${Math.round(timeoutMs / 1000)}s`)), timeoutMs);
-    return fetch(url, {
+    return fetchProviderUrl(providerItem, url, {
       method: "POST",
       headers: requestBody.stream === false ? headers : { ...headers, Accept: "text/event-stream" },
       body: JSON.stringify(requestBody),
