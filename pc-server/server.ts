@@ -10520,33 +10520,19 @@ async function fetchProviderUrl(
       throw new Error((stderr || stdout.toString("utf8") || `curl exit ${proc.exitCode}`).trim());
     }
     const textOut = stdout.toString("latin1");
-    const separator = textOut.includes("
-
-
-
-") ? "
-
-
-
-" : "
-
-";
-    const parts = textOut.split(separator).filter(Boolean);
-    const rawHeaders = parts.length > 1 ? parts.slice(0, -1).join(separator) : "";
-    const bodyText = parts.length > 1 ? parts[parts.length - 1] : textOut;
-    const bodyStart = Buffer.from(textOut.slice(0, textOut.length - bodyText.length), "latin1").length;
-    const body = stdout.subarray(bodyStart);
-    const headerBlock = rawHeaders ? rawHeaders.split(separator).pop() ?? "" : "";
-    const statusLine = headerBlock.split(/
-?
-/)[0] ?? "HTTP/1.1 200 OK";
+    const headerEnd = textOut.lastIndexOf("\r\n\r\n") >= 0
+      ? textOut.lastIndexOf("\r\n\r\n") + 4
+      : (textOut.lastIndexOf("\n\n") >= 0 ? textOut.lastIndexOf("\n\n") + 2 : 0);
+    const rawHeaders = headerEnd > 0 ? textOut.slice(0, headerEnd) : "";
+    const body = headerEnd > 0 ? stdout.subarray(Buffer.from(rawHeaders, "latin1").length) : stdout;
+    const separator = rawHeaders.includes("\r\n\r\n") ? "\r\n\r\n" : "\n\n";
+    const headerBlock = rawHeaders ? rawHeaders.split(separator).filter(Boolean).pop() ?? "" : "";
+    const statusLine = headerBlock.split(/\r?\n/)[0] ?? "HTTP/1.1 200 OK";
     const statusMatch = statusLine.match(/HTTP\/\d(?:\.\d)?\s+(\d{3})\s*(.*)$/i);
     const status = Number(statusMatch?.[1] ?? 200);
     const statusText = String(statusMatch?.[2] ?? "OK").trim() || "OK";
     const responseHeaders = new Headers();
-    for (const line of headerBlock.split(/
-?
-/).slice(1)) {
+    for (const line of headerBlock.split(/\r?\n/).slice(1)) {
       const idx = line.indexOf(":");
       if (idx <= 0) continue;
       responseHeaders.append(line.slice(0, idx).trim(), line.slice(idx + 1).trim());
@@ -14610,6 +14596,10 @@ async function callImageGeneration(input: {
   for (const item of Array.isArray(raw.data) ? raw.data : []) {
     const parsed = await parseImageDataItem(providerItem, item as Record<string, JsonValue> | undefined, defaultFormat);
     if (parsed) items.push(await saveGeneratedImage(parsed.data, parsed.mime, input.prompt, modelItem, "image_generation"));
+  }
+  if (items.length === 0) {
+    const revisedPrompt = typeof raw.revised_prompt === "string" ? ` revised_prompt=${raw.revised_prompt.slice(0, 500)}` : "";
+    throw new Error(`Generated no image items.${revisedPrompt} raw=${text.slice(0, 1000)}`);
   }
   return items;
 }
