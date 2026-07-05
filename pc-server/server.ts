@@ -14378,7 +14378,15 @@ function markOcrPendingParts(parts: JsonValue[], modelItem: Model) {
   });
 }
 
-function imageSize(aspectRatio: string) {
+function imageSize(aspectRatio: string, width?: number | null, height?: number | null) {
+  const normalizedWidth = Number.isFinite(width) ? Math.max(1, Math.floor(width as number)) : 0;
+  const normalizedHeight = Number.isFinite(height) ? Math.max(1, Math.floor(height as number)) : 0;
+  if (normalizedWidth > 0 && normalizedHeight > 0) {
+    return {
+      openai: `${normalizedWidth}x${normalizedHeight}`,
+      google: aspectRatio === "landscape" ? "16:9" : aspectRatio === "portrait" ? "9:16" : "1:1",
+    };
+  }
   switch (aspectRatio) {
     case "landscape":
       return { openai: "1536x1024", google: "16:9" };
@@ -14387,6 +14395,25 @@ function imageSize(aspectRatio: string) {
     default:
       return { openai: "1024x1024", google: "1:1" };
   }
+}
+
+function applyImageAdvancedOptions(
+  body: Record<string, JsonValue>,
+  input: {
+    negativePrompt?: string;
+    quality?: string;
+    style?: string;
+    background?: string;
+    outputFormat?: string;
+  },
+) {
+  const next: Record<string, JsonValue> = { ...body };
+  if (input.negativePrompt?.trim()) next.negative_prompt = input.negativePrompt.trim();
+  if (input.quality?.trim()) next.quality = input.quality.trim();
+  if (input.style?.trim()) next.style = input.style.trim();
+  if (input.background?.trim()) next.background = input.background.trim();
+  if (input.outputFormat?.trim()) next.output_format = input.outputFormat.trim();
+  return next;
 }
 
 function imageFileExtension(mime: string) {
@@ -14465,6 +14492,13 @@ async function callImageGeneration(input: {
   prompt: string;
   numberOfImages: number;
   aspectRatio: string;
+  width?: number | null;
+  height?: number | null;
+  negativePrompt?: string;
+  quality?: string;
+  style?: string;
+  background?: string;
+  outputFormat?: string;
   referenceFileIds?: number[];
 }) {
   const picked = findModel(state.settings.imageGenerationModelId);
@@ -14472,7 +14506,7 @@ async function callImageGeneration(input: {
   const modelItem = picked.model;
   const selectedModel = modelItem.modelId === "auto" ? "gpt-image-2" : modelItem.modelId;
   const count = Math.min(4, Math.max(1, Number(input.numberOfImages) || 1));
-  const sizes = imageSize(input.aspectRatio);
+  const sizes = imageSize(input.aspectRatio, input.width, input.height);
   const references = (input.referenceFileIds ?? [])
     .map((fileId) => state.files.find((file) => file.id === fileId))
     .filter(Boolean) as StoredFile[];
@@ -14530,6 +14564,11 @@ async function callImageGeneration(input: {
     form.append("prompt", input.prompt);
     form.append("n", String(count));
     form.append("size", sizes.openai);
+    if (input.negativePrompt?.trim()) form.append("negative_prompt", input.negativePrompt.trim());
+    if (input.quality?.trim()) form.append("quality", input.quality.trim());
+    if (input.style?.trim()) form.append("style", input.style.trim());
+    if (input.background?.trim()) form.append("background", input.background.trim());
+    if (input.outputFormat?.trim()) form.append("output_format", input.outputFormat.trim());
     const field = references.length === 1 ? "image" : "image[]";
     for (const reference of references) {
       form.append(field, new Blob([readFileSync(reference.path)], { type: reference.mime || "image/png" }), reference.fileName);
@@ -14567,7 +14606,13 @@ async function callImageGeneration(input: {
   }
 
   const endpoint = `${base}/images/generations`;
-  const body = applyModelCustomBody({ model: selectedModel, prompt: input.prompt, n: count, size: sizes.openai }, modelItem);
+  const body = applyModelCustomBody(
+    applyImageAdvancedOptions(
+      { model: selectedModel, prompt: input.prompt, n: count, size: sizes.openai },
+      input,
+    ),
+    modelItem,
+  );
   const response = await fetchProviderUrl(providerItem, endpoint, {
     method: "POST",
     headers: { ...headers, "Content-Type": "application/json" },
@@ -18106,13 +18151,32 @@ async function routeApi(request: Request, url: URL) {
     return json({ images: state.generatedImages });
   }
   if (path === "images/generate" && request.method === "POST") {
-    const body = await readJson<{ prompt: string; numberOfImages?: number; aspectRatio?: string; referenceFileIds?: number[] }>(request);
+    const body = await readJson<{
+      prompt: string;
+      numberOfImages?: number;
+      aspectRatio?: string;
+      width?: number | null;
+      height?: number | null;
+      negativePrompt?: string;
+      quality?: string;
+      style?: string;
+      background?: string;
+      outputFormat?: string;
+      referenceFileIds?: number[];
+    }>(request);
     if (!String(body.prompt ?? "").trim()) return error("Prompt is required", 400);
     try {
       const images = await callImageGeneration({
         prompt: String(body.prompt).trim(),
         numberOfImages: Number(body.numberOfImages ?? 1),
         aspectRatio: String(body.aspectRatio ?? "square"),
+        width: typeof body.width === "number" ? body.width : null,
+        height: typeof body.height === "number" ? body.height : null,
+        negativePrompt: typeof body.negativePrompt === "string" ? body.negativePrompt : "",
+        quality: typeof body.quality === "string" ? body.quality : "",
+        style: typeof body.style === "string" ? body.style : "",
+        background: typeof body.background === "string" ? body.background : "",
+        outputFormat: typeof body.outputFormat === "string" ? body.outputFormat : "",
         referenceFileIds: Array.isArray(body.referenceFileIds) ? body.referenceFileIds.map(Number).filter(Number.isFinite) : [],
       });
       return json({ status: "ok", images });

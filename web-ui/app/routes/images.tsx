@@ -1,6 +1,15 @@
 import * as React from "react";
 
-import { ArrowLeft, ImagePlus, Loader2, Plus, Trash2, WandSparkles, X } from "lucide-react";
+import {
+  ArrowLeft,
+  ChevronDown,
+  ImagePlus,
+  Loader2,
+  Plus,
+  Trash2,
+  WandSparkles,
+  X,
+} from "lucide-react";
 import { Link } from "react-router";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -19,11 +28,12 @@ import {
 } from "~/components/ui/select";
 import { Skeleton } from "~/components/ui/skeleton";
 import { Textarea } from "~/components/ui/textarea";
+import i18n from "~/i18n";
 import { normalizeImageForModelUpload } from "~/lib/image-normalize";
+import { cn } from "~/lib/utils";
 import api from "~/services/api";
 import { useSettingsStore } from "~/stores/app-store";
 import type { ProviderModel } from "~/types";
-import i18n from "~/i18n";
 
 interface UploadedFile {
   id: number;
@@ -54,26 +64,305 @@ type ImageModelOption = ProviderModel & {
   providerType?: string;
 };
 
-const ASPECT_RATIOS = [
-  { value: "square", labelKey: "common:image_page.ratio_square", description: "1024x1024" },
-  {
-    value: "landscape",
-    labelKey: "common:image_page.ratio_landscape",
-    description: "1536x1024 / 16:9",
-  },
-  {
-    value: "portrait",
-    labelKey: "common:image_page.ratio_portrait",
-    description: "1024x1536 / 9:16",
-  },
-];
+const ASPECT_PRESETS = [
+  { value: "square", labelKey: "common:image_page.ratio_square", description: "1024×1024", width: 1024, height: 1024 },
+  { value: "landscape", labelKey: "common:image_page.ratio_landscape", description: "1280×720", width: 1280, height: 720 },
+  { value: "portrait", labelKey: "common:image_page.ratio_portrait", description: "720×1280", width: 720, height: 1280 },
+] as const;
 
-export function meta() {
-  return [{ title: `${i18n.t("common:image_page.title")} - RikkaHub` }];
+const DEFAULT_OPTION_VALUE = "__default__";
+const QUALITY_OPTIONS = [DEFAULT_OPTION_VALUE, "auto", "low", "medium", "high"] as const;
+const STYLE_OPTIONS = [DEFAULT_OPTION_VALUE, "auto", "vivid", "natural", "anime", "photographic", "cinematic", "illustration"] as const;
+const BACKGROUND_OPTIONS = [DEFAULT_OPTION_VALUE, "auto", "opaque", "transparent", "white", "black"] as const;
+const OUTPUT_FORMAT_OPTIONS = [DEFAULT_OPTION_VALUE, "png", "jpeg", "webp"] as const;
+
+function presetForAspectRatio(value: string) {
+  return ASPECT_PRESETS.find((item) => item.value === value) ?? ASPECT_PRESETS[0];
 }
 
 function modelLabel(model: ProviderModel, fallback: string) {
   return model?.displayName || model?.modelId || fallback;
+}
+
+function normalizeDimensionInput(value: string) {
+  return value.replace(/[^\d]/g, "").slice(0, 5);
+}
+
+function optionLabel(
+  value: string,
+  fallbackKey: string,
+  t: (key: string, options?: Record<string, unknown>) => string,
+) {
+  return value && value !== DEFAULT_OPTION_VALUE
+    ? t(`image_page.option_${value}`, { defaultValue: value })
+    : t(fallbackKey);
+}
+
+interface ImageControlPanelProps {
+  mobile?: boolean;
+  t: (key: string, options?: Record<string, unknown>) => string;
+  settingsReady: boolean;
+  imageModels: ImageModelOption[];
+  selectedModel?: ImageModelOption;
+  selectedModelCanEdit: boolean;
+  numberOfImages: string;
+  setNumberOfImages: (value: string) => void;
+  aspectRatio: string;
+  onAspectRatioChange: (value: string) => void;
+  width: string;
+  setWidth: (value: string) => void;
+  height: string;
+  setHeight: (value: string) => void;
+  quality: string;
+  setQuality: (value: string) => void;
+  style: string;
+  setStyle: (value: string) => void;
+  background: string;
+  setBackground: (value: string) => void;
+  outputFormat: string;
+  setOutputFormat: (value: string) => void;
+  negativePrompt: string;
+  setNegativePrompt: (value: string) => void;
+  advancedOpen: boolean;
+  setAdvancedOpen: (value: boolean) => void;
+  selectModel: (modelId: string) => Promise<void>;
+  imageGenerationModelId?: string;
+}
+
+function ImageControlPanel(props: ImageControlPanelProps) {
+  const {
+    mobile,
+    t,
+    settingsReady,
+    imageModels,
+    selectedModel,
+    selectedModelCanEdit,
+    numberOfImages,
+    setNumberOfImages,
+    aspectRatio,
+    onAspectRatioChange,
+    width,
+    setWidth,
+    height,
+    setHeight,
+    quality,
+    setQuality,
+    style,
+    setStyle,
+    background,
+    setBackground,
+    outputFormat,
+    setOutputFormat,
+    negativePrompt,
+    setNegativePrompt,
+    advancedOpen,
+    setAdvancedOpen,
+    selectModel,
+    imageGenerationModelId,
+  } = props;
+
+  return (
+    <div className="space-y-4">
+      <div className="space-y-2">
+        <div className="text-sm font-medium">{t("image_page.model")}</div>
+        <Select
+          value={imageGenerationModelId || ""}
+          onValueChange={(value) => void selectModel(value)}
+        >
+          <SelectTrigger className="w-full">
+            <SelectValue placeholder={t("image_page.select_image_model")} />
+          </SelectTrigger>
+          <SelectContent>
+            {imageModels.map((model) => (
+              <SelectItem key={model.id} value={model.id}>
+                <span className="flex items-center gap-2">
+                  <AIIcon name={model.providerName || model.displayName} className="size-4" />
+                  {model.providerName ? `${model.providerName} / ` : ""}
+                  {modelLabel(model, t("image_page.not_selected"))}
+                </span>
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        {imageModels.length === 0 ? (
+          <div className="text-xs text-muted-foreground">{t("image_page.model_empty_hint")}</div>
+        ) : null}
+        {selectedModel && !selectedModelCanEdit ? (
+          <div className="text-xs text-muted-foreground">{t("image_page.model_edit_only_hint")}</div>
+        ) : null}
+      </div>
+
+      <div className={cn("grid gap-3", mobile ? "grid-cols-1 sm:grid-cols-2" : "grid-cols-2")}>
+        <div className="space-y-2">
+          <div className="text-sm font-medium">{t("image_page.count")}</div>
+          <Select value={numberOfImages} onValueChange={setNumberOfImages}>
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {[1, 2, 3, 4].map((value) => (
+                <SelectItem key={value} value={String(value)}>
+                  {value}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        <div className="space-y-2">
+          <div className="text-sm font-medium">{t("image_page.ratio")}</div>
+          <Select value={aspectRatio} onValueChange={onAspectRatioChange}>
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {ASPECT_PRESETS.map((item) => (
+                <SelectItem key={item.value} value={item.value}>
+                  {t(item.labelKey)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      </div>
+
+      <div className={cn("grid gap-3", mobile ? "grid-cols-1 sm:grid-cols-2" : "grid-cols-2")}>
+        <div className="space-y-2">
+          <div className="text-sm font-medium">{t("image_page.width")}</div>
+          <Input
+            inputMode="numeric"
+            min={1}
+            step={1}
+            value={width}
+            onChange={(event) => setWidth(normalizeDimensionInput(event.target.value))}
+            placeholder="1024"
+          />
+        </div>
+        <div className="space-y-2">
+          <div className="text-sm font-medium">{t("image_page.height")}</div>
+          <Input
+            inputMode="numeric"
+            min={1}
+            step={1}
+            value={height}
+            onChange={(event) => setHeight(normalizeDimensionInput(event.target.value))}
+            placeholder="1024"
+          />
+        </div>
+      </div>
+
+      <div className="flex items-center justify-between rounded-xl border bg-background/50 px-3 py-2 text-xs text-muted-foreground">
+        <span>{t("image_page.size_hint", { size: `${width || "-"} × ${height || "-"}` })}</span>
+        <span>{presetForAspectRatio(aspectRatio).description}</span>
+      </div>
+
+      <div className="rounded-xl border bg-background/40">
+        <button
+          type="button"
+          className="flex w-full items-center justify-between px-3 py-2 text-left"
+          onClick={() => setAdvancedOpen(!advancedOpen)}
+          disabled={!settingsReady}
+        >
+          <div>
+            <div className="text-sm font-medium">{t("image_page.advanced")}</div>
+            <div className="text-xs text-muted-foreground">{t("image_page.advanced_subtitle")}</div>
+          </div>
+          <ChevronDown className={cn("size-4 transition-transform", advancedOpen ? "rotate-180" : "")} />
+        </button>
+        {advancedOpen ? (
+          <div className="space-y-4 border-t px-3 py-3">
+            <div className="space-y-2">
+              <div className="text-sm font-medium">{t("image_page.negative_prompt")}</div>
+              <Textarea
+                value={negativePrompt}
+                onChange={(event) => setNegativePrompt(event.target.value)}
+                placeholder={t("image_page.negative_prompt_placeholder")}
+                className="min-h-24 resize-y"
+              />
+            </div>
+            <div className={cn("grid gap-3", mobile ? "grid-cols-1 sm:grid-cols-2" : "grid-cols-2")}>
+              <div className="space-y-2">
+                <div className="text-sm font-medium">{t("image_page.quality")}</div>
+                <Select
+                  value={quality || DEFAULT_OPTION_VALUE}
+                  onValueChange={(value) => setQuality(value === DEFAULT_OPTION_VALUE ? "" : value)}
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder={t("image_page.option_default")} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {QUALITY_OPTIONS.map((value) => (
+                      <SelectItem key={value || "default"} value={value}>
+                        {optionLabel(value, "image_page.option_default", t)}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <div className="text-sm font-medium">{t("image_page.style")}</div>
+                <Select
+                  value={style || DEFAULT_OPTION_VALUE}
+                  onValueChange={(value) => setStyle(value === DEFAULT_OPTION_VALUE ? "" : value)}
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder={t("image_page.option_default")} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {STYLE_OPTIONS.map((value) => (
+                      <SelectItem key={value || "default"} value={value}>
+                        {optionLabel(value, "image_page.option_default", t)}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <div className="text-sm font-medium">{t("image_page.background")}</div>
+                <Select
+                  value={background || DEFAULT_OPTION_VALUE}
+                  onValueChange={(value) => setBackground(value === DEFAULT_OPTION_VALUE ? "" : value)}
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder={t("image_page.option_default")} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {BACKGROUND_OPTIONS.map((value) => (
+                      <SelectItem key={value || "default"} value={value}>
+                        {optionLabel(value, "image_page.option_default", t)}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <div className="text-sm font-medium">{t("image_page.output_format")}</div>
+                <Select
+                  value={outputFormat || DEFAULT_OPTION_VALUE}
+                  onValueChange={(value) => setOutputFormat(value === DEFAULT_OPTION_VALUE ? "" : value)}
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder={t("image_page.option_default")} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {OUTPUT_FORMAT_OPTIONS.map((value) => (
+                      <SelectItem key={value || "default"} value={value}>
+                        {optionLabel(value, "image_page.option_default", t)}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+            <div className="text-xs text-muted-foreground">{t("image_page.advanced_hint")}</div>
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+export function meta() {
+  return [{ title: `${i18n.t("common:image_page.title")} - RikkaHub` }];
 }
 
 export default function ImagesPage() {
@@ -81,8 +370,16 @@ export default function ImagesPage() {
   const settings = useSettingsStore((state) => state.settings);
   const setSettings = useSettingsStore((state) => state.setSettings);
   const [prompt, setPrompt] = React.useState("");
+  const [negativePrompt, setNegativePrompt] = React.useState("");
   const [numberOfImages, setNumberOfImages] = React.useState("1");
   const [aspectRatio, setAspectRatio] = React.useState("square");
+  const [width, setWidth] = React.useState(String(ASPECT_PRESETS[0].width));
+  const [height, setHeight] = React.useState(String(ASPECT_PRESETS[0].height));
+  const [quality, setQuality] = React.useState("");
+  const [style, setStyle] = React.useState("");
+  const [background, setBackground] = React.useState("");
+  const [outputFormat, setOutputFormat] = React.useState("");
+  const [advancedOpen, setAdvancedOpen] = React.useState(false);
   const [referenceImages, setReferenceImages] = React.useState<UploadedFile[]>([]);
   const [images, setImages] = React.useState<GeneratedImage[]>([]);
   const [generating, setGenerating] = React.useState(false);
@@ -114,6 +411,7 @@ export default function ImagesPage() {
   const selectedModel = imageModels.find((model) => model.id === settings?.imageGenerationModelId);
   const selectedModelCanEdit = selectedModel?.providerType === "openai";
   const editBlocked = referenceImages.length > 0 && selectedModel ? !selectedModelCanEdit : false;
+  const requestedImageCount = Math.min(4, Math.max(1, Number(numberOfImages) || 1));
 
   const refreshImages = React.useCallback(async () => {
     const response = await api.get<{ images: GeneratedImage[] }>("images");
@@ -147,6 +445,13 @@ export default function ImagesPage() {
     [setSettings, settings],
   );
 
+  const onAspectRatioChange = React.useCallback((value: string) => {
+    const preset = presetForAspectRatio(value);
+    setAspectRatio(value);
+    setWidth(String(preset.width));
+    setHeight(String(preset.height));
+  }, []);
+
   const uploadReferenceImages = React.useCallback(
     async (files: FileList | null) => {
       if (!files?.length) return;
@@ -176,14 +481,27 @@ export default function ImagesPage() {
       toast.error(t("image_page.edit_blocked_msg"));
       return;
     }
+    const widthValue = Number(width);
+    const heightValue = Number(height);
+    if (!Number.isInteger(widthValue) || widthValue <= 0 || !Number.isInteger(heightValue) || heightValue <= 0) {
+      toast.error(t("image_page.size_invalid"));
+      return;
+    }
     setGenerating(true);
     try {
       const response = await api.post<{ images: GeneratedImage[] }>(
         "images/generate",
         {
           prompt: prompt.trim(),
-          numberOfImages: Number(numberOfImages),
+          negativePrompt: negativePrompt.trim(),
+          numberOfImages: requestedImageCount,
           aspectRatio,
+          width: widthValue,
+          height: heightValue,
+          quality,
+          style,
+          background,
+          outputFormat,
           referenceFileIds: referenceImages.map((image) => image.id),
         },
         { timeout: false },
@@ -199,25 +517,27 @@ export default function ImagesPage() {
     }
   }, [
     aspectRatio,
+    background,
     editBlocked,
-    numberOfImages,
+    height,
+    negativePrompt,
+    outputFormat,
     prompt,
+    quality,
     referenceImages,
+    requestedImageCount,
     settings?.imageGenerationModelId,
+    style,
     t,
+    width,
   ]);
 
   return (
     <div className="flex h-screen bg-background text-foreground">
-      {/* aside 顶部 pt-9 让出沉浸式透明标题栏高度,与设置页一致。 */}
-      <aside className="hidden w-[340px] shrink-0 border-r bg-sidebar/80 px-4 pb-4 pt-9 md:block">
+      <aside className="hidden w-[360px] shrink-0 border-r bg-sidebar/80 px-4 pb-4 pt-9 md:block">
         <div className="flex items-center justify-between">
           <Button asChild size="icon-sm" variant="ghost">
-            <Link
-              to="/"
-              aria-label={t("image_page.back_to_chat")}
-              title={t("image_page.back_to_chat")}
-            >
+            <Link to="/" aria-label={t("image_page.back_to_chat")} title={t("image_page.back_to_chat")}>
               <ArrowLeft className="size-4" />
             </Link>
           </Button>
@@ -232,73 +552,39 @@ export default function ImagesPage() {
           </div>
           <div className="text-sm text-muted-foreground">{t("image_page.description")}</div>
         </div>
-        <div className="mt-6 space-y-4">
-          <div className="space-y-2">
-            <div className="text-sm font-medium">{t("image_page.model")}</div>
-            <Select
-              value={settings?.imageGenerationModelId || ""}
-              onValueChange={(value) => void selectModel(value)}
-            >
-              <SelectTrigger className="w-full">
-                <SelectValue placeholder={t("image_page.select_image_model")} />
-              </SelectTrigger>
-              <SelectContent>
-                {imageModels.map((model) => (
-                  <SelectItem key={model.id} value={model.id}>
-                    <span className="flex items-center gap-2">
-                      <AIIcon name={model.providerName || model.displayName} className="size-4" />
-                      {model.providerName ? `${model.providerName} / ` : ""}
-                      {modelLabel(model, t("image_page.not_selected"))}
-                    </span>
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            {imageModels.length === 0 ? (
-              <div className="text-xs text-muted-foreground">
-                {t("image_page.model_empty_hint")}
-              </div>
-            ) : null}
-            {selectedModel && !selectedModelCanEdit ? (
-              <div className="text-xs text-muted-foreground">
-                {t("image_page.model_edit_only_hint")}
-              </div>
-            ) : null}
-          </div>
-          <div className="grid grid-cols-2 gap-3">
-            <div className="space-y-2">
-              <div className="text-sm font-medium">{t("image_page.count")}</div>
-              <Select value={numberOfImages} onValueChange={setNumberOfImages}>
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {[1, 2, 3, 4].map((value) => (
-                    <SelectItem key={value} value={String(value)}>
-                      {value}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="space-y-2">
-              <div className="text-sm font-medium">{t("image_page.ratio")}</div>
-              <Select value={aspectRatio} onValueChange={setAspectRatio}>
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {ASPECT_RATIOS.map((item) => (
-                    <SelectItem key={item.value} value={item.value}>
-                      {t(item.labelKey)}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
+        <div className="mt-6 rounded-2xl border bg-card/80 p-4 shadow-card">
+          <ImageControlPanel
+            t={t}
+            settingsReady={Boolean(settings)}
+            imageModels={imageModels}
+            selectedModel={selectedModel}
+            selectedModelCanEdit={Boolean(selectedModelCanEdit)}
+            numberOfImages={numberOfImages}
+            setNumberOfImages={setNumberOfImages}
+            aspectRatio={aspectRatio}
+            onAspectRatioChange={onAspectRatioChange}
+            width={width}
+            setWidth={setWidth}
+            height={height}
+            setHeight={setHeight}
+            quality={quality}
+            setQuality={setQuality}
+            style={style}
+            setStyle={setStyle}
+            background={background}
+            setBackground={setBackground}
+            outputFormat={outputFormat}
+            setOutputFormat={setOutputFormat}
+            negativePrompt={negativePrompt}
+            setNegativePrompt={setNegativePrompt}
+            advancedOpen={advancedOpen}
+            setAdvancedOpen={setAdvancedOpen}
+            selectModel={selectModel}
+            imageGenerationModelId={settings?.imageGenerationModelId}
+          />
         </div>
       </aside>
+
       <main className="flex min-w-0 flex-1 flex-col">
         <div className="border-b px-4 py-3 md:hidden">
           <div className="flex items-center justify-between">
@@ -310,15 +596,63 @@ export default function ImagesPage() {
             </Link>
           </div>
         </div>
+
         <ScrollArea className="flex-1">
           <div className="mx-auto max-w-6xl space-y-6 p-4 pb-8 md:pt-9">
-            <section className="rounded-xl border bg-card p-4 shadow-card">
+            <section className="rounded-2xl border bg-card/85 p-4 shadow-card md:hidden">
+              <ImageControlPanel
+                mobile
+                t={t}
+                settingsReady={Boolean(settings)}
+                imageModels={imageModels}
+                selectedModel={selectedModel}
+                selectedModelCanEdit={Boolean(selectedModelCanEdit)}
+                numberOfImages={numberOfImages}
+                setNumberOfImages={setNumberOfImages}
+                aspectRatio={aspectRatio}
+                onAspectRatioChange={onAspectRatioChange}
+                width={width}
+                setWidth={setWidth}
+                height={height}
+                setHeight={setHeight}
+                quality={quality}
+                setQuality={setQuality}
+                style={style}
+                setStyle={setStyle}
+                background={background}
+                setBackground={setBackground}
+                outputFormat={outputFormat}
+                setOutputFormat={setOutputFormat}
+                negativePrompt={negativePrompt}
+                setNegativePrompt={setNegativePrompt}
+                advancedOpen={advancedOpen}
+                setAdvancedOpen={setAdvancedOpen}
+                selectModel={selectModel}
+                imageGenerationModelId={settings?.imageGenerationModelId}
+              />
+            </section>
+
+            <section className="rounded-2xl border bg-card/90 p-4 shadow-card">
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-sm font-medium">{t("image_page.prompt")}</div>
+                  <div className="text-xs text-muted-foreground">{t("image_page.prompt_hint")}</div>
+                </div>
+                {selectedModel ? (
+                  <div className="rounded-full border px-3 py-1 text-xs text-muted-foreground">
+                    {selectedModel.providerName ? `${selectedModel.providerName} / ` : ""}
+                    {modelLabel(selectedModel, t("image_page.not_selected"))}
+                  </div>
+                ) : null}
+              </div>
+
               <Textarea
                 value={prompt}
                 onChange={(event) => setPrompt(event.target.value)}
                 placeholder={t("image_page.prompt_placeholder")}
-                className="min-h-28 resize-y border-0 bg-transparent p-0 text-base shadow-none placeholder:text-muted-foreground/60 focus-visible:ring-0"
+                className="min-h-32 resize-y border-0 bg-transparent p-0 text-base shadow-none placeholder:text-muted-foreground/60 focus-visible:ring-0"
               />
+
               {referenceImages.length > 0 ? (
                 <div className="mt-4 flex flex-wrap gap-3">
                   {referenceImages.map((image) => (
@@ -326,14 +660,10 @@ export default function ImagesPage() {
                       key={image.id}
                       className="group relative size-24 overflow-hidden rounded-md border bg-muted"
                     >
-                      <img
-                        src={image.url}
-                        alt={image.fileName}
-                        className="size-full object-cover"
-                      />
+                      <img src={image.url} alt={image.fileName} className="size-full object-cover" />
                       <button
                         type="button"
-                        className="absolute top-1 right-1 rounded-full bg-background/90 p-1 opacity-0 shadow transition group-hover:opacity-100"
+                        className="absolute right-1 top-1 rounded-full bg-background/90 p-1 opacity-0 shadow transition group-hover:opacity-100"
                         onClick={() =>
                           setReferenceImages((current) =>
                             current.filter((item) => item.id !== image.id),
@@ -347,8 +677,9 @@ export default function ImagesPage() {
                   ))}
                 </div>
               ) : null}
-              <div className="mt-4 flex items-center justify-between gap-3">
-                <div className="flex items-center gap-2">
+
+              <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <div className="flex flex-wrap items-center gap-2">
                   <input
                     ref={inputRef}
                     className="sr-only"
@@ -387,11 +718,7 @@ export default function ImagesPage() {
                   onClick={() => void generate()}
                   disabled={generating || !settings?.imageGenerationModelId || editBlocked}
                 >
-                  {generating ? (
-                    <Loader2 className="size-4 animate-spin" />
-                  ) : (
-                    <Plus className="size-4" />
-                  )}
+                  {generating ? <Loader2 className="size-4 animate-spin" /> : <Plus className="size-4" />}
                   {referenceImages.length ? t("image_page.edit") : t("image_page.generate")}
                 </Button>
               </div>
@@ -399,7 +726,7 @@ export default function ImagesPage() {
 
             <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
               {generating &&
-                Array.from({ length: Number(numberOfImages) }).map((_, index) => (
+                Array.from({ length: requestedImageCount }).map((_, index) => (
                   <article
                     key={`skeleton-${index}`}
                     className="overflow-hidden rounded-xl border bg-card shadow-sm"
@@ -416,11 +743,7 @@ export default function ImagesPage() {
                   key={image.id}
                   initial={{ opacity: 0, scale: 0.96, y: 8 }}
                   animate={{ opacity: 1, scale: 1, y: 0 }}
-                  transition={{
-                    duration: 0.3,
-                    delay: index * 0.05,
-                    ease: [0.16, 1, 0.3, 1],
-                  }}
+                  transition={{ duration: 0.3, delay: index * 0.05, ease: [0.16, 1, 0.3, 1] }}
                   className="group overflow-hidden rounded-xl border bg-card shadow-sm transition-shadow hover:shadow-card"
                 >
                   <a
@@ -463,6 +786,7 @@ export default function ImagesPage() {
                 </motion.article>
               ))}
             </section>
+
             {images.length === 0 ? (
               <div className="rounded-lg border border-dashed p-10 text-center text-sm text-muted-foreground">
                 {t("image_page.empty")}
