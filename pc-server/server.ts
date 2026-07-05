@@ -10263,35 +10263,64 @@ async function fetchProviderUrl(
 
   const method = String(init.method ?? "GET").toUpperCase();
   const headers = new Headers(init.headers ?? {});
-  const tmpBodyPath = method === "GET" || init.body == null
-    ? ""
-    : join(process.env.TEMP || process.env.TMP || ".", `rikka-ecnu-${Date.now()}-${Math.random().toString(16).slice(2)}.json`);
-  if (tmpBodyPath) {
-    const bodyText = typeof init.body === "string"
-      ? init.body
-      : init.body instanceof Uint8Array
-        ? new TextDecoder().decode(init.body)
-        : String(init.body);
-    await Bun.write(tmpBodyPath, bodyText);
-  }
+  const tempDir = process.env.TEMP || process.env.TMP || ".";
+  const tempFiles: string[] = [];
   const args = ["--silent", "--show-error", "--include", "--request", method, url];
+
+  const registerTempFile = (suffix: string) => {
+    const filePath = join(tempDir, `rikka-ecnu-${Date.now()}-${Math.random().toString(16).slice(2)}${suffix}`);
+    tempFiles.push(filePath);
+    return filePath;
+  };
+
   headers.forEach((value, key) => {
+    if (key.toLowerCase() === "content-length") return;
     args.push("-H", `${key}: ${value}`);
   });
-  if (tmpBodyPath) {
-    args.push("--data-binary", `@${tmpBodyPath}`);
-  }
-  try {
-    const proc = Bun.spawnSync(["curl.exe", ...args], { stdout: "pipe", stderr: "pipe", timeout: 60_000 });
-    const stdout = new TextDecoder().decode(proc.stdout ?? new Uint8Array());
-    const stderr = new TextDecoder().decode(proc.stderr ?? new Uint8Array());
-    if (proc.exitCode !== 0) {
-      throw new Error((stderr || stdout || `curl exit ${proc.exitCode}`).trim());
+
+  if (method !== "GET" && init.body != null) {
+    if (typeof FormData !== "undefined" && init.body instanceof FormData) {
+      headers.delete("content-type");
+      headers.delete("Content-Type");
+      for (const [key, value] of init.body.entries()) {
+        if (typeof value === "string") {
+          args.push("-F", `${key}=${value}`);
+          continue;
+        }
+        const filePath = registerTempFile("-upload.bin");
+        const bytes = Buffer.from(await value.arrayBuffer());
+        await Bun.write(filePath, bytes);
+        const fieldParts = [`${key}=@${filePath}`];
+        if ((value as File).name) fieldParts.push(`filename=${(value as File).name}`);
+        if (value.type) fieldParts.push(`type=${value.type}`);
+        args.push("-F", fieldParts.join(";"));
+      }
+    } else {
+      const tmpBodyPath = registerTempFile(".body");
+      const bodyBytes = typeof init.body === "string"
+        ? Buffer.from(init.body)
+        : init.body instanceof Uint8Array
+          ? Buffer.from(init.body)
+          : Buffer.from(String(init.body));
+      await Bun.write(tmpBodyPath, bodyBytes);
+      args.push("--data-binary", `@${tmpBodyPath}`);
     }
-    const separator = stdout.includes("\r\n\r\n") ? "\r\n\r\n" : "\n\n";
-    const chunks = stdout.split(separator).filter(Boolean);
-    const rawHeaders = chunks.length > 1 ? chunks.slice(0, -1).join(separator) : "";
-    const body = chunks.length > 1 ? chunks[chunks.length - 1] : stdout;
+  }
+
+  try {
+    const proc = Bun.spawnSync(["curl.exe", ...args], { stdout: "pipe", stderr: "pipe", timeout: 120_000 });
+    const stdout = Buffer.from(proc.stdout ?? new Uint8Array());
+    const stderr = new TextDecoder().decode(proc.stderr ?? new Uint8Array());
+    if (proc.exitCode != 0) {
+      throw new Error((stderr || stdout.toString("utf8") || `curl exit ${proc.exitCode}`).trim());
+    }
+    const textOut = stdout.toString("latin1");
+    const separator = textOut.includes("\r\n\r\n") ? "\r\n\r\n" : "\n\n";
+    const parts = textOut.split(separator).filter(Boolean);
+    const rawHeaders = parts.length > 1 ? parts.slice(0, -1).join(separator) : "";
+    const bodyText = parts.length > 1 ? parts[parts.length - 1] : textOut;
+    const bodyStart = Buffer.from(textOut.slice(0, textOut.length - bodyText.length), "latin1").length;
+    const body = stdout.subarray(bodyStart);
     const headerBlock = rawHeaders ? rawHeaders.split(separator).pop() ?? "" : "";
     const statusLine = headerBlock.split(/\r?\n/)[0] ?? "HTTP/1.1 200 OK";
     const statusMatch = statusLine.match(/HTTP\/\d(?:\.\d)?\s+(\d{3})\s*(.*)$/i);
@@ -10305,8 +10334,10 @@ async function fetchProviderUrl(
     }
     return new Response(body, { status, statusText, headers: responseHeaders });
   } finally {
-    if (tmpBodyPath && existsSync(tmpBodyPath)) {
-      try { unlinkSync(tmpBodyPath); } catch {}
+    for (const filePath of tempFiles) {
+      if (existsSync(filePath)) {
+        try { unlinkSync(filePath); } catch {}
+      }
     }
   }
 }
@@ -12269,7 +12300,7 @@ async function streamClaudeChatWithTools(
   for (let round = 0; round < MAX_TOOL_STEPS; round += 1) {
     if (signal?.aborted) throw new DOMException("Generation stopped", "AbortError");
     const roundStarted = Date.now();
-    const response = await fetch(url, {
+    const response = await fetchProviderUrl(providerItem, url, {
       method: "POST",
       headers: { ...headers, Accept: "text/event-stream" },
       body: JSON.stringify(currentBody),
@@ -12413,7 +12444,7 @@ async function fetchClaudeTextWithTools(
 
   for (let round = 0; round < MAX_TOOL_STEPS; round += 1) {
     const started = Date.now();
-    const response = await fetch(url, { method: "POST", headers, body: JSON.stringify(currentBody), signal });
+    const response = await fetchProviderUrl(providerItem, url, { method: "POST", headers, body: JSON.stringify(currentBody), signal });
     const rawText = await response.text();
     let raw: any = {};
     try {
@@ -12666,7 +12697,7 @@ async function streamGoogleChatWithTools(
   for (let round = 0; round < MAX_TOOL_STEPS; round += 1) {
     if (signal?.aborted) throw new DOMException("Generation stopped", "AbortError");
     const roundStarted = Date.now();
-    const response = await fetch(streamUrl, {
+    const response = await fetchProviderUrl(providerItem, streamUrl, {
       method: "POST",
       headers: { ...headers, Accept: "text/event-stream" },
       body: JSON.stringify(currentBody),
@@ -12779,7 +12810,7 @@ async function fetchOpenAiText(
   let allContent = "";
   for (let round = 0; round < MAX_TOOL_STEPS; round += 1) {
     const started = Date.now();
-    const response = await fetch(url, { method: "POST", headers, body: JSON.stringify(currentBody), signal });
+    const response = await fetchProviderUrl(providerItem, url, { method: "POST", headers, body: JSON.stringify(currentBody), signal });
     const rawText = await response.text();
     let raw: any = {};
     try {
@@ -14175,6 +14206,7 @@ function imageFormatToMime(format: string | undefined): string {
 // 下载图片并 base64 编码,用响应 Content-Type 作 MIME。
 // 兼容部分 OpenAI 兼容代理(如腾讯云 COS)只返回 url、不返回 b64_json 的情况。
 async function parseImageDataItem(
+  providerItem: Provider,
   item: Record<string, JsonValue> | undefined,
   defaultFormat: string,
 ): Promise<{ data: string; mime: string } | null> {
@@ -14186,7 +14218,7 @@ async function parseImageDataItem(
   }
   const url = String(item.url ?? "");
   if (!url) return null;
-  const dlResp = await fetch(url);
+  const dlResp = await fetchProviderUrl(providerItem, url);
   if (!dlResp.ok) throw new Error(`Failed to download generated image: ${dlResp.status}`);
   const buf = Buffer.from(await dlResp.arrayBuffer());
   const contentType = dlResp.headers.get("content-type")?.split(";")[0]?.trim();
@@ -14251,7 +14283,7 @@ async function callImageGeneration(input: {
       instances: [{ prompt: input.prompt }],
       parameters: { sampleCount: count, aspectRatio: sizes.google },
     }, modelItem);
-    const response = await fetch(endpoint, {
+    const response = await fetchProviderUrl(providerItem, endpoint, {
       method: "POST",
       headers: applyModelRequestHeaders({ "Content-Type": "application/json" }, providerItem, modelItem),
       body: JSON.stringify(body),
@@ -14303,7 +14335,7 @@ async function callImageGeneration(input: {
     for (const entry of customBodyEntriesForForm(modelItem)) {
       form.append(entry.key, customFormValue(entry.value));
     }
-    const response = await fetch(endpoint, { method: "POST", headers, body: form });
+    const response = await fetchProviderUrl(providerItem, endpoint, { method: "POST", headers, body: form });
     const text = await response.text();
     addLog({
       providerId: providerItem.id,
@@ -14326,7 +14358,7 @@ async function callImageGeneration(input: {
     const sourceFileIds = references.map((file) => file.id);
     const items = [];
     for (const item of Array.isArray(raw.data) ? raw.data : []) {
-      const parsed = await parseImageDataItem(item as Record<string, JsonValue> | undefined, defaultFormat);
+      const parsed = await parseImageDataItem(providerItem, item as Record<string, JsonValue> | undefined, defaultFormat);
       if (parsed) items.push(await saveGeneratedImage(parsed.data, parsed.mime, input.prompt, modelItem, "image_edit", sourceFileIds));
     }
     return items;
@@ -14334,7 +14366,7 @@ async function callImageGeneration(input: {
 
   const endpoint = `${base}/images/generations`;
   const body = applyModelCustomBody({ model: selectedModel, prompt: input.prompt, n: count, size: sizes.openai }, modelItem);
-  const response = await fetch(endpoint, {
+  const response = await fetchProviderUrl(providerItem, endpoint, {
     method: "POST",
     headers: { ...headers, "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -14360,7 +14392,7 @@ async function callImageGeneration(input: {
   const defaultFormat = String(raw.output_format ?? "png");
   const items = [];
   for (const item of Array.isArray(raw.data) ? raw.data : []) {
-    const parsed = await parseImageDataItem(item as Record<string, JsonValue> | undefined, defaultFormat);
+    const parsed = await parseImageDataItem(providerItem, item as Record<string, JsonValue> | undefined, defaultFormat);
     if (parsed) items.push(await saveGeneratedImage(parsed.data, parsed.mime, input.prompt, modelItem, "image_generation"));
   }
   return items;
