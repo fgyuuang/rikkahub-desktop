@@ -10471,7 +10471,7 @@ async function fetchProviderUrl(
   const headers = new Headers(init.headers ?? {});
   const tempDir = process.env.TEMP || process.env.TMP || ".";
   const tempFiles: string[] = [];
-  const args = ["--silent", "--show-error", "--include", "--request", method, url];
+  const args = ["--silent", "--show-error", "--include", "--ssl-revoke-best-effort", "--request", method, url];
 
   const registerTempFile = (suffix: string) => {
     const filePath = join(tempDir, `rikka-ecnu-${Date.now()}-${Math.random().toString(16).slice(2)}${suffix}`);
