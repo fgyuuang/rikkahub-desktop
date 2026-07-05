@@ -1,5 +1,5 @@
 import { createHash, createHmac } from "node:crypto";
-import { chmodSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import { dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import process from "node:process";
@@ -94,14 +94,25 @@ interface S3Config {
   items: string[];
 }
 
+type ProxyMode = "auto" | "manual" | "direct" | "env";
+
 interface ProxyConfig {
-  // User-set proxy URL. Empty string means "follow the system proxy automatically"
-  // (Windows registry → Bun env), matching browser-like behavior for non-technical users.
+  // 代理模式:
+  // - auto: 跟随系统代理(Windows 注册表 / GNOME gsettings), 配合活性探测自动降级
+  // - manual: 使用 url 指定的固定代理, 同样支持活性探测与降级
+  // - direct: 强制直连, 完全忽略系统代理声明(系统代理失效时的逃生口)
+  // - env: 完全由 HTTPS_PROXY/HTTP_PROXY 环境变量控制(Docker 部署), UI 只读
+  mode: ProxyMode;
+  // manual 模式下的代理地址(auto/direct/env 下被忽略)。空字符串在 manual 下等同直连。
   url: string;
   // Optional HTTP basic auth credentials, applied as `http://user:pass@host:port` when
-  // forwarding to upstream APIs.
+  // forwarding to upstream APIs. 仅 manual 模式生效。
   username: string;
   password: string;
+  // 代理绕过规则: 逗号分隔的域名/通配符列表, 命中的 URL 直连不走代理。
+  // 例 "*.internal.corp,10.0.0.0/8,git.company.com"。localhost/127.0.0.1/::1 永远 bypass(硬编码)。
+  // 仅 mode=auto/manual 生效; env(Docker) / direct 忽略。
+  bypassRules: string;
 }
 
 interface Assistant {
@@ -612,7 +623,7 @@ function startAnalytics(): void {
 // MUST be kept in sync with web-ui/src-tauri/tauri.conf.json's `version` field. The update
 // checker compares this against the latest GitHub release tag and the version is also shown
 // verbatim in the About page. If you bump tauri.conf.json's version, bump this too.
-const APP_VERSION = "1.4.0";
+const APP_VERSION = "1.4.1";
 
 type GithubRelease = {
   tag_name?: string;
@@ -1123,9 +1134,12 @@ function defaultSettings(): Settings {
       items: ["DATABASE", "FILES"],
     },
     proxyConfig: {
+      // 容器部署默认 env(docker 注入 HTTPS_PROXY); 桌面默认 auto(跟随系统代理)
+      mode: RUNNING_IN_CONTAINER ? "env" : "auto",
       url: "",
       username: "",
       password: "",
+      bypassRules: "",
     },
     webServerJwtEnabled: false,
     preferredPort: null,
@@ -2329,16 +2343,16 @@ function clearNodeBroadcast(conversation: Conversation, node: MessageNode) {
 //      browsers and Clash/V2Ray "规则代理 / 系统代理" mode set it. This is the path that
 //      "just works" for users who have a proxy tool running.
 //
-// The result is mirrored into `HTTPS_PROXY`/`HTTP_PROXY` env vars because Bun's `fetch()`
-// reads those dynamically — so every LLM / search / MCP request picks up the proxy. We
-// refresh every 10 s so toggling Clash on/off propagates without restarting the app.
+// ⚠️ Bun fetch 在进程首次网络请求时快照 HTTPS_PROXY/HTTP_PROXY/NO_PROXY env 并永久锁定,
+// 之后运行时改 env 不读 (实测 Bun 1.3.13)。所以"写 env 让 fetch 自动走代理"的路线在运行时
+// 切换代理 / 降级 / mode 切换场景下失效。改为: 启动时清空 env 防 Bun 锁定 (见
+// installProxyFetchInterceptor), 拦截 globalThis.fetch, per-request 按当前代理状态显式传
+// `proxy` 选项。env 只在容器 (mode=env) 场景保留 —— 让 Bun 快照 docker 注入的 HTTPS_PROXY。
 
-const SYSTEM_PROXY_REFRESH_MS = 10_000;
-const USER_SET_HTTPS_PROXY = process.env.HTTPS_PROXY?.trim();
-const USER_SET_HTTP_PROXY = process.env.HTTP_PROXY?.trim();
-const USER_SET_NO_PROXY = process.env.NO_PROXY?.trim();
-let lastAppliedEffectiveProxy: string | undefined;
 let lastDetectedSystemProxy: string | undefined;
+// 实际监听端口(Bun.serve 绑定后赋值)。端口顺延后可能与 preferredPort 不同,
+// proxyStatusPayload 返回给前端用于显示"当前运行端口"(P2-5)。
+let actualServingPort: number | undefined;
 
 function parseProxyServerValue(value: string): string | undefined {
   if (!value) return undefined;
@@ -2351,7 +2365,9 @@ function parseProxyServerValue(value: string): string | undefined {
       const [k, v] = piece.split("=");
       if (k && v) map.set(k.trim().toLowerCase(), v.trim());
     }
-    const target = map.get("https") ?? map.get("http") ?? map.get("socks");
+    // P0-3: 不 fallback 到 socks=。Bun fetch 只支持 http/https 代理, 把 SOCKS 端口当
+    // HTTP 代理用会导致 CONNECT 握手挂起。注册表只有 socks= 时返回 undefined(等同无系统代理)。
+    const target = map.get("https") ?? map.get("http");
     if (!target) return undefined;
     return /^https?:\/\//i.test(target) ? target : `http://${target}`;
   }
@@ -2377,6 +2393,49 @@ function readWindowsSystemProxy(): string | undefined {
   }
 }
 
+// Linux 桌面 GNOME 代理读取(gsettings)。仅处理 mode='manual'(明确主机端口);
+// 'none' 返回 undefined; 'auto'(PAC) 不支持(我们不实现 PAC 解析)。
+// KDE 暂不支持, 用户可在 UI 手动填代理(mode=manual)。
+function readGnomeProxy(): string | undefined {
+  if (process.platform !== "linux") return undefined;
+  try {
+    const run = (args: string[]) =>
+      Bun.spawnSync(["gsettings", ...args], { stdout: "pipe", stderr: "ignore" });
+    const modeRaw = run(["get", "org.gnome.system.proxy", "mode"]).stdout?.toString().trim();
+    if (!modeRaw || modeRaw === "'none'") return undefined;
+    if (modeRaw !== "'manual'") return undefined; // 'auto'(PAC) 未实现
+    const host = run(["get", "org.gnome.system.proxy.http", "host"]).stdout?.toString().trim().replace(/^'|'$/g, "");
+    const port = run(["get", "org.gnome.system.proxy.http", "port"]).stdout?.toString().trim();
+    if (!host || !port || host === "''" || port === "0") return undefined;
+    return `http://${host}:${port}`;
+  } catch {
+    return undefined;
+  }
+}
+
+// 统一的系统代理读取入口(auto 模式调用): Windows 读注册表, Linux 桌面读 GNOME。
+// Docker 容器返回 undefined(容器代理走 env, 由 mode=env 处理, 不走 auto)。
+//
+// 带 2s TTL 缓存: auto 模式下每个 fetch 请求都调本函数, 裸调会每请求 spawnSync 两次 reg
+// query (Win) / gsettings (Linux), 同步阻塞后端主线程几十毫秒。模型流式 + 工具调用 burst
+// 时一回合可能十几次 fetch, 这些注册表读取串行累加会让对话明显卡顿。缓存让 TTL 窗口内的
+// 请求共用一次读取。代理开关变更有最多 TTL 的滞后, 与设置页 3s 轮询叠加, 用户体感基本即时。
+// 手动"检测"按钮(/settings/proxy/detect)直接调底层 readWindowsSystemProxy 绕过缓存,
+// 保证用户主动操作拿到的是最新值。
+let systemProxyCache: { value: string | undefined; ts: number } | null = null;
+const SYSTEM_PROXY_TTL_MS = 2000;
+function readSystemProxy(): string | undefined {
+  const now = Date.now();
+  if (systemProxyCache && now - systemProxyCache.ts < SYSTEM_PROXY_TTL_MS) {
+    return systemProxyCache.value;
+  }
+  let value: string | undefined;
+  if (RUNTIME_PLATFORM === "win") value = readWindowsSystemProxy();
+  else if (RUNTIME_PLATFORM === "linux" && !RUNNING_IN_CONTAINER) value = readGnomeProxy();
+  systemProxyCache = { value, ts: now };
+  return value;
+}
+
 function composeProxyUrl(base: string, username: string, password: string): string {
   const trimmed = base.trim();
   if (!trimmed) return "";
@@ -2393,36 +2452,160 @@ function composeProxyUrl(base: string, username: string, password: string): stri
   }
 }
 
-function resolveEffectiveProxy(): { url: string | undefined; source: "manual" | "system" | "none" } {
+function resolveEffectiveProxy(): { url: string | undefined; source: "manual" | "system" | "env" | "none" } {
   const cfg = state?.settings?.proxyConfig;
-  const manual = cfg?.url?.trim();
-  if (manual) {
-    return { url: composeProxyUrl(manual, cfg!.username ?? "", cfg!.password ?? ""), source: "manual" };
+  const mode = cfg?.mode ?? "auto";
+
+  if (mode === "direct") {
+    // 强制直连: 完全忽略系统代理声明, 用户显式选择的逃生口
+    return { url: undefined, source: "none" };
   }
-  const system = readWindowsSystemProxy();
+
+  if (mode === "env") {
+    // 完全由 env 控制(Docker): 读当前 env 值用于展示, 不由我们写入(applyEffectiveProxy 也是 no-op)
+    const envUrl = process.env.HTTPS_PROXY?.trim() || process.env.HTTP_PROXY?.trim();
+    return { url: envUrl || undefined, source: envUrl ? "env" : "none" };
+  }
+
+  if (mode === "manual") {
+    const manual = cfg?.url?.trim();
+    if (manual) {
+      return { url: composeProxyUrl(manual, cfg!.username ?? "", cfg!.password ?? ""), source: "manual" };
+    }
+    return { url: undefined, source: "none" };
+  }
+
+  // mode === "auto": 跟随系统代理(Windows 注册表 / GNOME gsettings)
+  const system = readSystemProxy();
   lastDetectedSystemProxy = system;
   if (system) return { url: system, source: "system" };
   return { url: undefined, source: "none" };
 }
 
 function applyEffectiveProxy() {
+  // 代理的 per-request 应用由 installProxyFetchInterceptor 安装的拦截器负责。
+  // 此函数仅做日志输出, 保留调用点不变 (updateSettings / settings/proxy POST 都调它)。
+  const mode = state?.settings?.proxyConfig?.mode ?? "auto";
+  if (mode === "env") {
+    const envUrl = process.env.HTTPS_PROXY?.trim() || process.env.HTTP_PROXY?.trim();
+    console.log(envUrl ? `[proxy] env: ${redactProxyForLog(envUrl)}` : "[proxy] env: direct (no HTTPS_PROXY)");
+    return;
+  }
   const { url, source } = resolveEffectiveProxy();
-  if (url === lastAppliedEffectiveProxy) return;
-  lastAppliedEffectiveProxy = url;
-  if (!USER_SET_HTTPS_PROXY) {
-    if (url) process.env.HTTPS_PROXY = url;
-    else delete process.env.HTTPS_PROXY;
-  }
-  if (!USER_SET_HTTP_PROXY) {
-    if (url) process.env.HTTP_PROXY = url;
-    else delete process.env.HTTP_PROXY;
-  }
-  if (!USER_SET_NO_PROXY) {
-    // localhost/loopback must always bypass — the sidecar's own webview and smoke tests
-    // talk to 127.0.0.1 and would otherwise loop through the proxy.
-    process.env.NO_PROXY = "localhost,127.0.0.1,::1";
-  }
   console.log(url ? `[proxy] ${source}: ${redactProxyForLog(url)}` : "[proxy] direct (no proxy)");
+}
+
+// bypassRules 匹配 (逻辑移植自 opencode proxy-from-env 的 shouldProxy + kelivo CIDR)。
+// localhost/127.0.0.1/::1 永远 bypass (硬编码, 即使没配 rules); 用户 rules 支持精确域名 /
+// 通配 (*.example.com / .example.com) / host:port 端口限定 / IPv4 CIDR 网段 (10.0.0.0/8)。
+// CIDR 仅当 target 是 IP 字面量时生效 (域名请求时拿到的是域名不是 IP, CIDR 没法判断)。
+function shouldBypassProxy(targetUrl: string, userRules: string): boolean {
+  let hostname: string;
+  let port: number;
+  try {
+    const u = new URL(targetUrl);
+    hostname = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    port = u.port ? parseInt(u.port, 10) : u.protocol === "https:" || u.protocol === "wss:" ? 443 : 80;
+  } catch {
+    return false; // URL 解析不出, 不 bypass (让请求正常发出, 由调用方处理错误)
+  }
+  const noProxy = `localhost,127.0.0.1,::1,${userRules}`.toLowerCase();
+  for (const rule of noProxy.split(/[,\s]/)) {
+    const trimmed = rule.trim();
+    if (!trimmed) continue;
+    const parsed = trimmed.match(/^(.+):(\d+)$/);
+    const rh = parsed ? parsed[1] : trimmed;
+    const rp = parsed ? parseInt(parsed[2], 10) : 0;
+    if (rp && rp !== port) continue; // 端口限定的规则, 端口不匹配跳过
+    if (rh === "*") return true; // 全 bypass
+    if (rh.includes("/")) {
+      // CIDR 网段 (10.0.0.0/8): target 必须是 IPv4 字面量
+      if (ipInCidr(hostname, rh)) return true;
+      continue;
+    }
+    if (rh.startsWith("*")) {
+      // *.example.com 匹配 example.com 及子域
+      if (hostname === rh.slice(2) || hostname.endsWith(rh.slice(1))) return true;
+    } else if (rh.startsWith(".")) {
+      // .example.com 匹配子域
+      if (hostname.endsWith(rh)) return true;
+    } else {
+      if (hostname === rh) return true;
+    }
+  }
+  return false;
+}
+
+// IPv4 点分十进制 → 无符号 32 位整数。非法格式返回 null。
+function ipv4ToInt(ip: string): number | null {
+  const parts = ip.split(".");
+  if (parts.length !== 4) return null;
+  let n = 0;
+  for (const p of parts) {
+    const v = Number(p);
+    if (!Number.isInteger(v) || v < 0 || v > 255) return null;
+    n = n * 256 + v;
+  }
+  return n >>> 0;
+}
+
+// IPv4 CIDR 网段匹配 (移植自 kelivo _matchesCidr, 简化为仅 IPv4)。
+// cidr 格式 "10.0.0.0/8"; prefix 0 = 全匹配, 32 = 精确 IP。
+function ipInCidr(ip: string, cidr: string): boolean {
+  const ci = cidr.indexOf("/");
+  if (ci < 0) return false;
+  const net = cidr.slice(0, ci).trim();
+  const prefix = parseInt(cidr.slice(ci + 1).trim(), 10);
+  if (!Number.isInteger(prefix) || prefix < 0 || prefix > 32) return false;
+  const ipInt = ipv4ToInt(ip);
+  const netInt = ipv4ToInt(net);
+  if (ipInt === null || netInt === null) return false;
+  if (prefix === 0) return true;
+  const mask = prefix === 32 ? 0xffffffff : ((1 << prefix) - 1) << (32 - prefix);
+  return ((ipInt & mask) >>> 0) === ((netInt & mask) >>> 0);
+}
+
+// Bun fetch 在进程首次网络请求时快照 HTTPS_PROXY/HTTP_PROXY/NO_PROXY env 并永久锁定
+// (实测 Bun 1.3.13)。本函数在 server 启动早期 (首次 fetch 前) 安装拦截:
+//   - 非容器部署: 清空 env 防 Bun 锁定旧代理
+//   - 容器部署 (mode=env): 保留 docker 注入的 HTTPS_PROXY, 让 Bun 快照它
+//   - 替换 globalThis.fetch, per-request 按当前代理状态显式传 proxy 选项
+function installProxyFetchInterceptor(): void {
+  if (!RUNNING_IN_CONTAINER) {
+    delete process.env.HTTPS_PROXY;
+    delete process.env.HTTP_PROXY;
+    delete process.env.https_proxy;
+    delete process.env.http_proxy;
+    delete process.env.NO_PROXY;
+    delete process.env.no_proxy;
+  }
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = function (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) {
+    // 调用方已显式传 proxy (如 /settings/proxy/test 端点): 尊重, 不拦截
+    const explicitProxy = (init as (RequestInit & { proxy?: string }) | undefined)?.proxy;
+    if (explicitProxy !== undefined) {
+      return originalFetch(input, init);
+    }
+    let target = "";
+    if (typeof input === "string") target = input;
+    else if (input instanceof URL) target = input.href;
+    else if (input instanceof Request) target = input.url;
+    const cfg = state?.settings?.proxyConfig;
+    const mode = cfg?.mode ?? "auto";
+    let proxy: string | undefined;
+    // env 模式 (Docker): 不注入, 让 Bun 用启动时快照的 docker env。
+    // direct: 强制直连。其余 (auto/manual): 按当前 resolveEffectiveProxy + bypass 决定。
+    if (mode !== "env" && mode !== "direct") {
+      const { url } = resolveEffectiveProxy();
+      if (url && !shouldBypassProxy(target, cfg?.bypassRules ?? "")) {
+        proxy = url;
+      }
+    }
+    if (proxy) {
+      return originalFetch(input, { ...(init as RequestInit), proxy } as RequestInit & { proxy: string });
+    }
+    return originalFetch(input, init);
+  } as typeof fetch;
 }
 
 function redactProxyForLog(url: string): string {
@@ -2433,6 +2616,28 @@ function redactProxyForLog(url: string): string {
   } catch {
     return url;
   }
+}
+
+// P1-6: 识别 fetch 错误是否疑似代理问题(ECONNREFUSED/ECONNRESET/407/CONNECT 失败等)。
+// 有代理时返回友好提示(替代泛化"请求失败:..."), 无代理返回 null(走原"请求失败"逻辑)。
+// 这是横向覆盖所有 provider 流式调用的最小注入点 —— send 端点 catch 调它即可。
+function classifyProxyError(err: unknown): string | null {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (!/ECONNREFUSED|ECONNRESET|EPIPE|_tunnel|proxy connect|407|Unable to connect|fetch failed/i.test(msg)) {
+    return null;
+  }
+  const { url, source } = resolveEffectiveProxy();
+  if (!url && source === "none") return null; // 无代理, 是普通网络/API 问题, 不冒充代理错误
+  const display = url ? redactProxyForLog(url) : "系统代理";
+  return `代理连接失败 (${display}) —— 请检查代理地址 / 端口 / 密码是否正确, 或在 设置 → 代理 中切换为「直连」模式。\n[原始错误] ${msg}`;
+}
+
+// 测试端点(供应商 / 搜索 / 图片 / 流式)共用的错误信息构造: 命中代理错误给友好提示,
+// 否则用原始消息。供应商/搜索测试的请求路径与对话相同(都走 installProxyFetchInterceptor),
+// 但各自的 catch 只报"请求未能发送", 代理错误被埋没在一堆可能原因里 —— 套这层让代理问题
+// 在所有页面都给出一致的精准提示。
+function friendlyRequestError(err: unknown): string {
+  return classifyProxyError(err) ?? (err instanceof Error ? err.message : String(err));
 }
 
 function proxyStatusPayload() {
@@ -2452,16 +2657,23 @@ function proxyStatusPayload() {
   }
   return {
     activeUrl: displayUrl ?? null,
-    source, // "manual" | "system" | "none"
+    source, // "manual" | "system" | "env" | "none"
     detectedSystemProxy: lastDetectedSystemProxy ?? null,
+    // 当前 mode 与容器标记, 前端据此决定 UI 分支(如 containerMode 锁定 mode=env 只读)
+    mode: state?.settings?.proxyConfig?.mode ?? "auto",
+    containerMode: RUNNING_IN_CONTAINER,
+    // 实际运行端口(顺延后可能与 preferredPort 不同), 前端口 Card 显示
+    runningPort: actualServingPort ?? null,
   };
 }
 
 let state = loadState();
 state.launchCount += 1;
 
+// 必须在首次 fetch 之前安装 (Bun.serve 接受请求之前), 否则首个请求触发 env 快照锁定。
+// 清空 env (非容器) + 拦截 globalThis.fetch, per-request 按当前代理状态显式传 proxy。
+installProxyFetchInterceptor();
 applyEffectiveProxy();
-setInterval(applyEffectiveProxy, SYSTEM_PROXY_REFRESH_MS).unref();
 
 
 
@@ -3378,11 +3590,22 @@ function normalizeS3Config(value: unknown): S3Config {
 
 function normalizeProxyConfig(value: unknown): ProxyConfig {
   const raw = isRecord(value) ? value : {};
-  return {
-    url: String(raw.url ?? "").trim(),
-    username: String(raw.username ?? ""),
-    password: String(raw.password ?? ""),
-  };
+  const url = String(raw.url ?? "").trim();
+  const username = String(raw.username ?? "");
+  const password = String(raw.password ?? "");
+  const bypassRules = String(raw.bypassRules ?? "").trim();
+  const rawMode = raw.mode;
+  let mode: ProxyMode;
+  if (rawMode === "auto" || rawMode === "manual" || rawMode === "direct" || rawMode === "env") {
+    mode = rawMode;
+  } else {
+    // 旧 settings 无 mode 字段(或值非法)→ 按平台推断, 保证旧行为兼容:
+    //   有 url → manual; 无 url + 容器 → env(docker 默认); 无 url + 桌面 → auto(跟随系统)
+    if (url) mode = "manual";
+    else if (RUNNING_IN_CONTAINER) mode = "env";
+    else mode = "auto";
+  }
+  return { mode, url, username, password, bypassRules };
 }
 
 // Port setting: integer in [1, 65535] or null (auto). Anything out of range / wrong type
@@ -8434,15 +8657,16 @@ function extractSingleZipMemberStreaming(zipPath: string, memberName: string): B
 // Android's document module is fully streaming (InputStream.copyTo / ZipFile.getInputStream
 // / MuPDF page-by-page), so it doesn't need explicit size caps — single-file memory peak
 // stays low even for multi-hundred-MB files. PC end's readFileSync-and-parse approach can't
-// match that everywhere without rewriting the zip parser, so we layer in size guards: above
-// these thresholds, extraction is skipped and prompt falls back to a brief notice (see
-// extractDocumentPromptText). 240 KB extracted-text cap is the existing prompt limit.
+// match that everywhere without rewriting the zip parser, so we layer in *file-size* guards:
+// above these thresholds, extraction is skipped and the prompt falls back to a brief notice
+// (see fallbackDocumentText). We do NOT cap extracted-text length — truncating a 6000-line
+// upload mid-stream broke large novel/log uploads (Android had no such cap). Models that
+// reject oversized prompts will surface the error themselves; that's the user's call.
 const MAX_PDF_EXTRACT_BYTES = 100 * 1024 * 1024;   // 100 MB — MuPDF streams pages, headroom for big books
-const MAX_DOCX_EXTRACT_BYTES = 50 * 1024 * 1024;   // 50 MB compressed (~5-10× decompressed XML)
+const MAX_DOCX_EXTRACT_BYTES = 100 * 1024 * 1024;  // 100 MB — >20 MB routes through streaming unzip, so heap stays bounded
 const MAX_PPTX_EXTRACT_BYTES = 100 * 1024 * 1024;  // 100 MB — PPTX often padded with embedded images
 const MAX_EPUB_EXTRACT_BYTES = 100 * 1024 * 1024;
-const MAX_TEXT_EXTRACT_BYTES = 10 * 1024 * 1024;   // plain text/code; above this we read only head
-const MAX_EXTRACTED_CHARS = 240_000;
+const MAX_TEXT_EXTRACT_BYTES = 100 * 1024 * 1024;  // plain text/code; OOM guard only (not a content cap) — covers any realistic novel/log
 // DOCX above this size routes to the external-unzip path (`tar.exe` on Windows, `unzip` on
 // Linux) to extract only `word/document.xml`, instead of decompressing every zip entry into
 // JS heap. Threshold picked at the point where in-memory cost starts to matter.
@@ -8630,7 +8854,7 @@ function extractEpubFromOpf(
     if (content) parts.push(content);
   }
   const text = parts.join("\n\n").trim();
-  return text ? text.slice(0, MAX_EXTRACTED_CHARS) : "";
+  return text;
 }
 
 // Structured XHTML text extraction — mirrors Android's parseXhtml.
@@ -8698,8 +8922,7 @@ function extractEpubFallback(entries: Array<{ name: string; data: Buffer }>): st
   return textEntries
     .map((e) => stripXmlText(e.data.toString("utf8")))
     .filter(Boolean)
-    .join("\n\n")
-    .slice(0, MAX_EXTRACTED_CHARS);
+    .join("\n\n");
 }
 
 // Synchronous text extraction for the non-PDF formats. The three on-demand call sites
@@ -8736,29 +8959,17 @@ function extractStoredFileTextSync(entry: StoredFile): string {
       /\.(txt|md|markdown|csv|tsv|json|jsonl|yaml|yml|xml|html|htm|css|js|ts|tsx|jsx|py|java|kt|rs|go|c|cpp|h|hpp|cs|php|rb|sh|ps1|sql)$/i.test(name)
     ) {
       if (size > MAX_TEXT_EXTRACT_BYTES) {
-        // Don't readFileSync a 200 MB log file just to slice the first 240 KB —
-        // open + read the head with a bounded buffer instead.
-        return readTextFileHead(entry.path, MAX_EXTRACTED_CHARS);
+        // OOM guard: a >100 MB plain-text upload would balloon JS heap. Bail and let
+        // fallbackDocumentText tell the model the file is too large to inline. This is a
+        // memory ceiling, not content truncation — anything below it flows through in full.
+        return "";
       }
-      return readFileSync(entry.path, "utf8").slice(0, MAX_EXTRACTED_CHARS);
+      return readFileSync(entry.path, "utf8");
     }
   } catch (err) {
     console.warn(`[document] sync extract failed for ${entry.fileName}:`, err);
   }
   return "";
-}
-
-// Read at most `maxBytes` from the start of a text file without buffering the rest.
-// Used for very large text/log uploads where readFileSync would balloon JS heap.
-function readTextFileHead(pathValue: string, maxBytes: number): string {
-  const fd = openSync(pathValue, "r");
-  try {
-    const buf = Buffer.alloc(maxBytes);
-    const bytesRead = readSync(fd, buf, 0, maxBytes, 0);
-    return buf.subarray(0, bytesRead).toString("utf8");
-  } finally {
-    closeSync(fd);
-  }
 }
 
 // Full async version, used only by the upload endpoint. Adds PDF handling on top of the
@@ -8803,7 +9014,8 @@ function fallbackDocumentText(part: { fileName: string; url: string; entry: Stor
     ((mimeValue === "application/pdf" || name.endsWith(".pdf")) && size > MAX_PDF_EXTRACT_BYTES) ||
     ((mimeValue === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" || name.endsWith(".docx")) && size > MAX_DOCX_EXTRACT_BYTES) ||
     ((mimeValue === "application/vnd.openxmlformats-officedocument.presentationml.presentation" || name.endsWith(".pptx")) && size > MAX_PPTX_EXTRACT_BYTES) ||
-    ((mimeValue === "application/epub+zip" || name.endsWith(".epub")) && size > MAX_EPUB_EXTRACT_BYTES);
+    ((mimeValue === "application/epub+zip" || name.endsWith(".epub")) && size > MAX_EPUB_EXTRACT_BYTES) ||
+    ((mimeValue.startsWith("text/") || /\.(txt|md|markdown|csv|tsv|json|jsonl|yaml|yml|xml|html|htm|css|js|ts|tsx|jsx|py|java|kt|rs|go|c|cpp|h|hpp|cs|php|rb|sh|ps1|sql)$/i.test(name)) && size > MAX_TEXT_EXTRACT_BYTES);
   if (overCap) {
     return `[Document: ${fileName} — too large to inline (${sizeMb} MB). Ask the user to split it or describe the part they need.]`;
   }
@@ -8831,19 +9043,13 @@ async function extractPdfText(pathValue: string): Promise<string> {
   try {
     const pageCount = doc.countPages();
     const parts: string[] = [];
-    let totalLen = 0;
     for (let i = 0; i < pageCount; i++) {
       const page = doc.loadPage(i);
       try {
         const stext = page.toStructuredText();
         try {
           // Aligned with Android: "---Page ${i+1}:\n${stext.asText()}"
-          const pageText = stext.asText();
-          parts.push(`---Page ${i + 1}:\n${pageText}`);
-          totalLen += pageText.length;
-          // Early-stop once we've crossed the prompt cap. Saves time and memory for
-          // 1000-page PDFs where the model only sees the first chunk anyway.
-          if (totalLen > MAX_EXTRACTED_CHARS) break;
+          parts.push(`---Page ${i + 1}:\n${stext.asText()}`);
         } finally {
           stext.destroy?.();
         }
@@ -8851,7 +9057,7 @@ async function extractPdfText(pathValue: string): Promise<string> {
         page.destroy?.();
       }
     }
-    return parts.join("\n").slice(0, MAX_EXTRACTED_CHARS);
+    return parts.join("\n");
   } finally {
     doc.destroy?.();
   }
@@ -8880,7 +9086,7 @@ function extractDocxText(pathValue: string, sizeBytes?: number) {
   const xml = docXmlData.toString("utf8");
   // Extract body content
   const bodyMatch = xml.match(/<w:body[\s>]?([\s\S]*?)<\/w:body>/i);
-  if (!bodyMatch) return stripXmlText(xml).slice(0, MAX_EXTRACTED_CHARS);
+  if (!bodyMatch) return stripXmlText(xml);
   const body = bodyMatch[1];
   const result: string[] = [];
   // Walk top-level blocks in document order. We can't naively split on </w:p> because
@@ -8898,7 +9104,7 @@ function extractDocxText(pathValue: string, sizeBytes?: number) {
       if (text) result.push(text);
     }
   }
-  return result.join("\n\n").slice(0, MAX_EXTRACTED_CHARS);
+  return result.join("\n\n");
 }
 
 function extractDocxParagraph(xml: string): string {
@@ -8993,7 +9199,7 @@ function extractPptxText(pathValue: string) {
     if (notes) slide += `\n\n### Speaker Notes\n\n${notes}`;
     slides.push(slide);
   }
-  return slides.join("\n\n").slice(0, MAX_EXTRACTED_CHARS);
+  return slides.join("\n\n");
 }
 
 function parsePptxSlideXml(xml: string): string {
@@ -10275,13 +10481,12 @@ async function fetchProviderUrl(
 
   headers.forEach((value, key) => {
     if (key.toLowerCase() === "content-length") return;
+    if (typeof FormData !== "undefined" && init.body instanceof FormData && key.toLowerCase() === "content-type") return;
     args.push("-H", `${key}: ${value}`);
   });
 
   if (method !== "GET" && init.body != null) {
     if (typeof FormData !== "undefined" && init.body instanceof FormData) {
-      headers.delete("content-type");
-      headers.delete("Content-Type");
       for (const [key, value] of init.body.entries()) {
         if (typeof value === "string") {
           args.push("-F", `${key}=${value}`);
@@ -10311,23 +10516,37 @@ async function fetchProviderUrl(
     const proc = Bun.spawnSync(["curl.exe", ...args], { stdout: "pipe", stderr: "pipe", timeout: 120_000 });
     const stdout = Buffer.from(proc.stdout ?? new Uint8Array());
     const stderr = new TextDecoder().decode(proc.stderr ?? new Uint8Array());
-    if (proc.exitCode != 0) {
+    if (proc.exitCode !== 0) {
       throw new Error((stderr || stdout.toString("utf8") || `curl exit ${proc.exitCode}`).trim());
     }
     const textOut = stdout.toString("latin1");
-    const separator = textOut.includes("\r\n\r\n") ? "\r\n\r\n" : "\n\n";
+    const separator = textOut.includes("
+
+
+
+") ? "
+
+
+
+" : "
+
+";
     const parts = textOut.split(separator).filter(Boolean);
     const rawHeaders = parts.length > 1 ? parts.slice(0, -1).join(separator) : "";
     const bodyText = parts.length > 1 ? parts[parts.length - 1] : textOut;
     const bodyStart = Buffer.from(textOut.slice(0, textOut.length - bodyText.length), "latin1").length;
     const body = stdout.subarray(bodyStart);
     const headerBlock = rawHeaders ? rawHeaders.split(separator).pop() ?? "" : "";
-    const statusLine = headerBlock.split(/\r?\n/)[0] ?? "HTTP/1.1 200 OK";
+    const statusLine = headerBlock.split(/
+?
+/)[0] ?? "HTTP/1.1 200 OK";
     const statusMatch = statusLine.match(/HTTP\/\d(?:\.\d)?\s+(\d{3})\s*(.*)$/i);
     const status = Number(statusMatch?.[1] ?? 200);
     const statusText = String(statusMatch?.[2] ?? "OK").trim() || "OK";
     const responseHeaders = new Headers();
-    for (const line of headerBlock.split(/\r?\n/).slice(1)) {
+    for (const line of headerBlock.split(/
+?
+/).slice(1)) {
       const idx = line.indexOf(":");
       if (idx <= 0) continue;
       responseHeaders.append(line.slice(0, idx).trim(), line.slice(idx + 1).trim());
@@ -10403,14 +10622,11 @@ function reasoningPayloadForProvider(providerItem: Provider, modelItem: Model, l
     return { reasoning_effort: normalized };
   }
   if (host === "chat.intern-ai.org.cn") return { thinking_mode: enabled };
-  if (host === "chat.ecnu.edu.cn") {
-    if (normalized === "off") return { thinking: { type: "disabled" } };
-    return { thinking: { type: "enabled" } };
-  }
-  // Generic OpenAI-compatible fallback: prefer a plain thinking switch.
-  // Only emit strength/effort for hosts with explicit mappings above.
-  if (normalized === "off") return { thinking: { type: "disabled" } };
-  return { thinking: { type: "enabled" } };
+  // Android default else branch: passes effort through as-is (including "xhigh").
+  // OFF maps to "low" (lowest budget), AUTO sends no field.
+  if (normalized === "auto") return {};
+  if (normalized === "off") return { reasoning_effort: "low" };
+  return { reasoning_effort: normalized };
 }
 
 function auxiliaryReasoningPayloadForProvider(providerItem: Provider, modelItem: Model, level: string | null | undefined) {
@@ -13662,7 +13878,7 @@ async function fetchOpenAiTextStreaming(
       else signal.addEventListener("abort", abortHandler, { once: true });
     }
     timeout = setTimeout(() => controller.abort(new Error(`Response header timeout: no response from provider for ${Math.round(timeoutMs / 1000)}s`)), timeoutMs);
-    return fetchProviderUrl(providerItem, url, {
+    return fetch(url, {
       method: "POST",
       headers: requestBody.stream === false ? headers : { ...headers, Accept: "text/event-stream" },
       body: JSON.stringify(requestBody),
@@ -14978,7 +15194,18 @@ function startAsrRealtimeSession(client: any, providerId?: string) {
         Authorization: `Bearer ${provider.apiKey}`,
         ...(provider.type === "dashscope" ? { "OpenAI-Beta": "realtime=v1" } : {}),
       };
-  const upstream = new WebSocket(endpoint, { headers });
+  // Bun 的 WebSocket 不自动读 HTTPS_PROXY env (跟 fetch 不同), 必须显式传 proxy 选项,
+  // 否则 ASR/TTS 的 wss 请求在配了代理的环境下会绕过代理直连失败。
+  const wsProxy: string | undefined = (() => {
+    const cfg = state?.settings?.proxyConfig;
+    const mode = cfg?.mode ?? "auto";
+    if (mode === "env" || mode === "direct") return undefined;
+    const { url } = resolveEffectiveProxy();
+    if (!url) return undefined;
+    if (shouldBypassProxy(endpoint, cfg?.bypassRules ?? "")) return undefined;
+    return url;
+  })();
+  const upstream = new WebSocket(endpoint, wsProxy ? { headers, proxy: wsProxy } : { headers });
   session.upstream = upstream;
   upstream.binaryType = "arraybuffer";
   upstream.onopen = () => {
@@ -15279,13 +15506,15 @@ async function generateAnswer(conversation: Conversation, regenerateAtNodeId?: s
       broadcastConversation(conversation);
       return;
     }
-    const content = err instanceof Error ? err.message : String(err);
+    const rawContent = err instanceof Error ? err.message : String(err);
+    const proxyHint = classifyProxyError(err);
+    const failureText = proxyHint ?? `请求失败：${rawContent}`;
     applyOutputTransforms(currentMessage, assistant);
     finishReasoningParts(currentMessage);
     if (currentMessage.parts.length === 0) {
-      finishMessage(currentMessage, [{ type: "text", text: `请求失败：${content}` }]);
+      finishMessage(currentMessage, [{ type: "text", text: failureText }]);
     } else {
-      appendTextPart(currentMessage, `\n\n请求失败：${content}`);
+      appendTextPart(currentMessage, `\n\n${failureText}`);
       currentMessage.finishedAt = new Date().toISOString();
     }
     ensureUsage(currentMessage, conversation);
@@ -15340,10 +15569,17 @@ function truncateConversationForRegenerate(conversation: Conversation, messageId
 }
 
 function updateSettings(next: Settings) {
+  // 代理配置变化时记一条日志。实际生效由 fetch 拦截器 per-request 现读 resolveEffectiveProxy 保证,
+  // 无需手动刷新 env / 探测 —— 配置变化下一次请求自动跟上。
+  const prevProxyUrl = resolveEffectiveProxy().url;
   state.settings = next;
   saveState();
   broadcastSettings();
   broadcastList();
+  const newProxyUrl = resolveEffectiveProxy().url;
+  if (newProxyUrl !== prevProxyUrl) {
+    applyEffectiveProxy();
+  }
 }
 
 async function routeApi(request: Request, url: URL) {
@@ -16082,7 +16318,7 @@ async function routeApi(request: Request, url: URL) {
       }
       return json(result);
     } catch (err) {
-      return error(err instanceof Error ? err.message : String(err), 502);
+      return error(friendlyRequestError(err), 502);
     }
   }
   const searchDelete = path.match(/^settings\/search\/service\/([^/]+)$/);
@@ -16200,7 +16436,7 @@ async function routeApi(request: Request, url: URL) {
           ok: false,
           status: 0,
           endpoint: endpointFor(providerItem),
-          preview: err instanceof Error ? err.message : String(err),
+          preview: friendlyRequestError(err),
         })));
       }
       markProviderTestResult(providerItem, result.models, checks);
@@ -16215,7 +16451,7 @@ async function routeApi(request: Request, url: URL) {
         preview: result.preview,
       });
     } catch (err) {
-      return error(err instanceof Error ? err.message : String(err), 502);
+      return error(friendlyRequestError(err), 502);
     }
   }
 
@@ -16243,7 +16479,7 @@ async function routeApi(request: Request, url: URL) {
         image: { url: generated.url, mime: generated.mime, fileName: generated.fileName },
       });
     } catch (err) {
-      return error(err instanceof Error ? err.message : String(err), 502);
+      return error(friendlyRequestError(err), 502);
     } finally {
       state.settings.imageGenerationModelId = previousImageId;
     }
@@ -16277,7 +16513,7 @@ async function routeApi(request: Request, url: URL) {
               ok: false,
               status: 0,
               endpoint: endpointFor(providerItem),
-              preview: err instanceof Error ? err.message : String(err),
+              preview: friendlyRequestError(err),
             }));
             checks.push(check);
             send("check", check);
@@ -16294,7 +16530,7 @@ async function routeApi(request: Request, url: URL) {
             preview: result.preview,
           });
         } catch (err) {
-          send("error", { error: err instanceof Error ? err.message : String(err) });
+          send("error", { error: friendlyRequestError(err) });
         } finally {
           controller.close();
         }
@@ -17007,7 +17243,7 @@ async function routeApi(request: Request, url: URL) {
           const items = await webDavListBackups(state.settings.webDavConfig);
           send("done", { status: "ok", fileName: result.fileName, size: result.size, items });
         } catch (err) {
-          send("error", { error: err instanceof Error ? err.message : String(err) });
+          send("error", { error: friendlyRequestError(err) });
         } finally {
           controller.close();
         }
@@ -17028,7 +17264,7 @@ async function routeApi(request: Request, url: URL) {
           });
           send("done", { status: "restored", settings: state.settings });
         } catch (err) {
-          send("error", { error: err instanceof Error ? err.message : String(err) });
+          send("error", { error: friendlyRequestError(err) });
         } finally {
           controller.close();
         }
@@ -17099,7 +17335,7 @@ async function routeApi(request: Request, url: URL) {
           const items = await s3ListBackups(state.settings.s3Config);
           send("done", { status: "ok", fileName: result.fileName, size: result.size, items });
         } catch (err) {
-          send("error", { error: err instanceof Error ? err.message : String(err) });
+          send("error", { error: friendlyRequestError(err) });
         } finally {
           controller.close();
         }
@@ -17120,7 +17356,7 @@ async function routeApi(request: Request, url: URL) {
           });
           send("done", { status: "restored", settings: state.settings });
         } catch (err) {
-          send("error", { error: err instanceof Error ? err.message : String(err) });
+          send("error", { error: friendlyRequestError(err) });
         } finally {
           controller.close();
         }
@@ -17130,6 +17366,15 @@ async function routeApi(request: Request, url: URL) {
   }
   if (path === "settings/proxy" && request.method === "POST") {
     const body = await readJson<Partial<ProxyConfig>>(request);
+    // P0-2: Bun fetch 静默丢弃 SOCKS 代理(表现为直连失败), 这里显式拒绝。
+    // 前端 save() 也有同样校验, 此处为防御性(防止其它调用方绕过前端直接 POST)。
+    const trimmedUrl = String(body?.url ?? "").trim();
+    if (/^socks/i.test(trimmedUrl)) {
+      return json(
+        { error: "SOCKS proxy is not supported (Bun fetch only handles HTTP/HTTPS). Please use the proxy tool's HTTP port." },
+        { status: 400 },
+      );
+    }
     const proxyConfig = normalizeProxyConfig(body);
     updateSettings({ ...state.settings, proxyConfig });
     applyEffectiveProxy();
@@ -17152,6 +17397,40 @@ async function routeApi(request: Request, url: URL) {
   }
   if (path === "settings/proxy/status" && request.method === "GET") {
     return json(proxyStatusPayload());
+  }
+  if (path === "settings/proxy/test" && request.method === "POST") {
+    // 测试当前生效代理能否真的连通。显式传 proxy 选项绕过 env —— 否则降级态下 env 已清,
+    // fetch 会直连成功, 误判成"代理通了"。用户可指定测试 URL (默认 generate_204 轻量快速)。
+    const { url } = resolveEffectiveProxy();
+    if (!url) return json({ ok: false, error: "no_proxy" });
+    let testUrl = "https://www.gstatic.com/generate_204";
+    try {
+      const body = await request.json();
+      if (typeof body?.url === "string") {
+        let u = body.url.trim();
+        // 用户可能填 "example.com" 不带协议 — 自动补 https://, 否则下面的正则会拒绝,
+        // 回退到默认 gstatic, 表现为"改了测试 URL 但梯子日志仍 ping gstatic"。
+        if (u && !/^https?:\/\//i.test(u)) u = `https://${u}`;
+        if (/^https?:\/\//i.test(u)) testUrl = u;
+      }
+    } catch { /* 空 body 用默认 */ }
+    const t0 = Date.now();
+    try {
+      const resp = await fetch(testUrl, {
+        proxy: url,
+        signal: AbortSignal.timeout(8000),
+        redirect: "manual",
+      });
+      // 2xx/3xx 都算通 (代理能回应 = 通; 5xx 可能是代理报错或目标不可达, 算不通)
+      const ok = resp.status >= 200 && resp.status < 400;
+      return json({ ok, status: resp.status, latencyMs: Date.now() - t0 });
+    } catch (e) {
+      return json({
+        ok: false,
+        error: e instanceof Error ? e.message : String(e),
+        latencyMs: Date.now() - t0,
+      });
+    }
   }
   if (path === "data/export/status" && request.method === "GET") {
     const cachedDbPath = join(dataDir, "rikka_hub_cached.db");
@@ -17848,7 +18127,7 @@ async function routeApi(request: Request, url: URL) {
       });
       return json({ status: "ok", images });
     } catch (err) {
-      return error(err instanceof Error ? err.message : String(err), 502);
+      return error(friendlyRequestError(err), 502);
     }
   }
   const generatedImageDelete = path.match(/^images\/([^/]+)$/);
@@ -18038,6 +18317,7 @@ const { server, port } = (() => {
 // Machine-readable marker parsed by the Tauri shell (src-tauri/src/lib.rs) to learn which port
 // the sidecar actually bound to — the shell navigates the webview here when 8080 was taken.
 // Keep it a single line with the exact `RIKKAHUB_PORT:<port>` prefix.
+actualServingPort = port;
 console.log(`RIKKAHUB_PORT:${port}`);
 
 console.log(`RikkaHub PC server running at http://localhost:${port}`);

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Display settings — user nickname, avatar, theme, fonts and other purely visual preferences.
  */
 export interface DisplaySetting {
@@ -209,6 +209,7 @@ export interface ProviderProfile {
   promptCacheTtl?: "5m" | "1h";
   /** OpenAI providers only — 是否在历史回放里把 reasoning_content 回传给上游（默认开启）。对齐安卓 e63d017。 */
   includeHistoryReasoning?: boolean;
+  forceDirectTransport?: boolean;
   [key: string]: unknown;
 }
 
